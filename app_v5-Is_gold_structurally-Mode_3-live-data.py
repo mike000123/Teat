@@ -992,7 +992,7 @@ def build_word_report(latest_row: pd.Series,
                 "Crisis-conditioned gold response: unavailable (insufficient similar months or missing GOLD_USD).")
 
     else:
-        doc.add_paragraph("Market Acceleration mode answers: Is the market currently rewarding gold (or pressuring it) regardless of the slow macro regime?"
+        doc.add_paragraph("Market Acceleration mode answers: “Is the market currently rewarding gold (or pressuring it) regardless of the slow macro regime?"
         )
 
     # RSI overlay (non-scored diagnostic)
@@ -1215,7 +1215,7 @@ def build_word_report(latest_row: pd.Series,
 # -----------------------------
 st.set_page_config(page_title="Gold Macro Cockpit", layout="wide")
 
-st.title("Macro Regime & Market Intelligence Signals")
+st.title("Test")
 
 with st.expander("How to interpret this model"):
     st.markdown("""
@@ -2596,6 +2596,5 @@ if st.button("Generate Word report (.docx)"):
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
-cessingml.document"
+.openxmlformats-officedocument.wordprocessingml.document"
     )
-)
