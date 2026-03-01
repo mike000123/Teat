@@ -992,7 +992,7 @@ def build_word_report(latest_row: pd.Series,
                 "Crisis-conditioned gold response: unavailable (insufficient similar months or missing GOLD_USD).")
 
     else:
-        doc.add_paragraph("Market Acceleration mode answers: “Is the market currently rewarding gold (or pressuring it) regardless of the slow macro regime?"
+        doc.add_paragraph("Market Acceleration mode answers: Is the market currently rewarding gold (or pressuring it) regardless of the slow macro regime?"
         )
 
     # RSI overlay (non-scored diagnostic)
@@ -2598,3 +2598,4 @@ if st.button("Generate Word report (.docx)"):
     )
 cessingml.document"
     )
+)
