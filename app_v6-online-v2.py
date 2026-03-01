@@ -1215,7 +1215,7 @@ def build_word_report(latest_row: pd.Series,
 # -----------------------------
 st.set_page_config(page_title="Gold Macro Cockpit", layout="wide")
 
-st.title("MRMSI - Macro Regime & Market Signals Intelligence Platform")
+st.title("MRMIP - Macro Regime & Market Intelligence Platform")
 
 with st.expander("How to interpret this model"):
     st.markdown("""
@@ -1545,7 +1545,7 @@ with st.sidebar:
         intraday_interval = st.selectbox(
             "Intraday interval",
             ["1m", "5m", "15m", "30m", "60m"],
-            index=1,
+            index=0,
             disabled=(not show_intraday_rsi)
         )
 
