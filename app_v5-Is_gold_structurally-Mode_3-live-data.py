@@ -1215,7 +1215,7 @@ def build_word_report(latest_row: pd.Series,
 # -----------------------------
 st.set_page_config(page_title="Gold Macro Cockpit", layout="wide")
 
-st.title("Test")
+st.title("Gold Macro Cockpit (v4) — Weighted Regime + Crisis Threshold Presets")
 
 with st.expander("How to interpret this model"):
     st.markdown("""
@@ -2595,6 +2595,4 @@ if st.button("Generate Word report (.docx)"):
         data=docx_bytes,
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
-.openxmlformats-officedocument.wordprocessingml.document"
     )
