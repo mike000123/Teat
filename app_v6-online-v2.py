@@ -1215,7 +1215,7 @@ def build_word_report(latest_row: pd.Series,
 # -----------------------------
 st.set_page_config(page_title="Gold Macro Cockpit", layout="wide")
 
-st.title("MRMIP - Macro Regime & Market Intelligence Platform")
+st.title("MRMI - Macro Regime & Market Intelligence platform")
 
 with st.expander("How to interpret this model"):
     st.markdown("""
