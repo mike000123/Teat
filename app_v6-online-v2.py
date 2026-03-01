@@ -8,6 +8,7 @@ import tempfile
 import intraday_screener
 import time
 import streamlit.components.v1 as components
+import mc_simulator as mc
 
 from docx.shared import Inches
 from docx import Document
@@ -1388,10 +1389,12 @@ with st.sidebar:
     # ----------------------------
     st.subheader("Intraday RSI Screener (Top 10)")
 
-    _default_top10 = "AAPL MSFT NVDA AMZN META GOOGL TSLA AVGO COST AMD"
+    _default_top10 = "AAPL MSFT NVDA AMZN META GOOGL TSLA AVGO COST AMD WMT ASML MU NFLX PLTR CSCO AMAT LRCX PEP INTC "
+
+    MAX_TICKERS = 20
 
     raw_top10 = st.text_area(
-        "Tickers (space/comma/newline separated) — max 10",
+        f"Tickers (space/comma/newline separated) — max {MAX_TICKERS}",
         value=_default_top10,
         help="These tickers will be used in the Intraday RSI Screener tab."
     )
@@ -1402,7 +1405,7 @@ with st.sidebar:
         .tolist()
     )
     tickers_top10 = [t for t in tickers_top10 if t]
-    tickers_top10 = list(dict.fromkeys(tickers_top10))[:10]
+    tickers_top10 = list(dict.fromkeys(tickers_top10))[:MAX_TICKERS]
 
     # Build acceleration features (used by Mode C and/or Combined View)
     res_accel_base = compute_accel_features(res_base)
@@ -1483,6 +1486,27 @@ with st.sidebar:
     trig_hi = st.slider("Bull trigger (+)", 0.0, 1.5, 0.60, 0.05)
     trig_lo = st.slider("Bear trigger (−)", -1.5, 0.0, -0.60, 0.05)
     persist = st.slider("Persistence months", 1, 3, 2, 1)
+
+    # ----------------------------
+    # Monte Carlo Settings
+    # ----------------------------
+    st.subheader("Monte Carlo Settings")
+
+    mc_h = st.slider(
+        "Monte Carlo horizon (months)",
+        min_value=3,
+        max_value=24,
+        value=12,
+        step=1
+    )
+
+    mc_n = st.slider(
+        "Monte Carlo simulations",
+        min_value=500,
+        max_value=5000,
+        value=2000,
+        step=500
+    )
 
     # ----------------------------
     # Market Acceleration controls (Mode C) — shown when Accel mode is selected OR comparison includes Accel
@@ -2295,7 +2319,7 @@ if mode != "Market Acceleration (fast)":
 
 # --- Combined charts: (Left) RSI daily+monthly, (Right) Gold price
 if mode == "Market Acceleration (fast)":
-    tab1, tab2 = st.tabs(["Gold Acceleration", "Intraday RSI Screener (NASDAQ)"])
+    tab1, tab2, tab3 = st.tabs(["Gold Acceleration", "Intraday RSI Screener (NASDAQ)", "Monte Carlo"])
 
     # ----------------------------
     # TAB 1: GOLD ONLY
@@ -2491,6 +2515,64 @@ if mode == "Market Acceleration (fast)":
             tickers=tickers_top10,
             refresh_token=refresh_token
         )
+    # ----------------------------
+    # TAB 3: Monte Carlo
+    # ----------------------------
+    with tab3:
+        if mode != "Crisis Similarity (template)":
+
+            st.subheader("Monte Carlo Outlook")
+
+            paths, reg_now = mc.monte_carlo_paths_by_regime(
+                res,
+                price_col="GOLD_USD",
+                regime_col="REGIME",
+                horizon_months=mc_h,
+                n_sims=mc_n
+            )
+
+            if paths is None:
+                st.warning("Not enough regime history for Monte Carlo.")
+
+            else:
+                bands = mc.mc_percentiles(paths)
+
+                bands = bands.rename(columns={
+                    "p10": "p10 - Only 10% of simulations end up below this level",
+                    "p50": "p50 - 50% of simulations end up below this level",
+                    "p90": "p90 - 90% of simulations end up below this level",
+                })
+
+                st.line_chart(bands)
+
+                # 👇 Interpretation MUST be inside this else block
+
+                st.markdown(f"""
+    ### How to interpret this Monte Carlo fan chart
+
+    - **p10** → downside band  
+    - **p50** → typical path  
+    - **p90** → upside band  
+    
+    1) Directional bias
+    If p50 slopes upward, the regime historically tended to produce positive drift for gold.
+    If p50 slopes downward, the regime historically had negative drift.
+    2) Risk / volatility regime
+    If the gap between p10 and p90 is wide, the regime historically had high volatility / uncertainty.
+    If it’s narrow, the regime was more stable.
+    3) Downside risk (practical)
+    Look at where p10 is after 6–12 months.
+    That’s your “bad-but-not-crazy” downside under this regime (not worst case, but stress-ish).
+    4) Upside potential
+    Look at p90 after 6–12 months.
+    That’s your “good-but-not-crazy” upside.
+
+    **Current regime used for simulation:** `{reg_now}`  
+    **Simulation horizon:** `{mc_h}` months · **Simulations:** `{mc_n}`
+    """)
+
+        else:
+            st.info("Monte Carlo disabled in Crisis Similarity mode.")
 
     # ---- Gold-only panels must render ONLY in Tab1
     with tab1:

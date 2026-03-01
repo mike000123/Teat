@@ -212,7 +212,8 @@ def render_intraday_rsi_screener_tab(
 
     # You control the universe elsewhere (sidebar). Keep tab clean.
     tickers = [t.strip().upper() for t in (tickers or []) if t and isinstance(t, str)]
-    tickers = list(dict.fromkeys(tickers))[:10]
+    MAX_TICKERS = 20
+    tickers = list(dict.fromkeys(tickers))[:MAX_TICKERS]
 
     if not tickers:
         st.info("No tickers provided from the sidebar selection.")
