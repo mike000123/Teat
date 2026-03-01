@@ -219,11 +219,20 @@ def render_intraday_rsi_screener_tab(
         return
 
     # Fixed timeframes (no dropdowns here to avoid confusion)
-    DAILY_INTERVAL, DAILY_PERIOD = "1d", "6mo"
+    DAILY_INTERVAL, DAILY_PERIOD = "1d", "2y"
     I5_INTERVAL, I5_PERIOD = "5m", "5d"
 
     with st.spinner("Fetching data & computing RSI (Daily / 5m) + P/E…"):
-        close_d = yf_multi_close_fixed_period(tickers, interval="1d", period="2y", refresh_token=refresh_token)
+        # Include QQQ for relative strength benchmarking
+        tickers_rs = tickers + ["QQQ"] if "QQQ" not in tickers else tickers
+        close_d_all = yf_multi_close_fixed_period(tickers_rs, interval="1d", period=DAILY_PERIOD,
+                                                  refresh_token=refresh_token)
+
+        # Split: universe vs benchmark
+        close_d = close_d_all.drop(columns=["QQQ"], errors="ignore")
+        qqq_d = close_d_all["QQQ"].dropna() if (not close_d_all.empty and "QQQ" in close_d_all.columns) else pd.Series(
+            dtype=float)
+
         close_5 = yf_multi_close_fixed_period(tickers, interval="5m", period="5d", refresh_token=refresh_token)
         pe_df = yf_pe_snapshot(tickers, refresh_token=refresh_token)
 
@@ -264,6 +273,37 @@ def render_intraday_rsi_screener_tab(
             return np.nan
         return float(series.dropna().rolling(window).mean().iloc[-1])
 
+    def trailing_return(series: pd.Series, periods: int) -> float:
+        """Return over last N bars: (last / prevN) - 1."""
+        if series is None or series.dropna().empty:
+            return np.nan
+        s = series.dropna()
+        if len(s) <= periods:
+            return np.nan
+        try:
+            return float(s.iloc[-1] / s.iloc[-(periods + 1)] - 1.0)
+        except Exception:
+            return np.nan
+
+    def ma_slope(series: pd.Series, ma_window: int = 50, slope_lookback: int = 20) -> float:
+        """
+        MA slope = MA(t) - MA(t-lookback).
+        Returns % slope relative to MA(t-lookback) for comparability.
+        """
+        if series is None or series.dropna().empty:
+            return np.nan
+        s = series.dropna()
+        if len(s) < (ma_window + slope_lookback + 5):
+            return np.nan
+        ma = s.rolling(ma_window).mean().dropna()
+        if len(ma) <= slope_lookback:
+            return np.nan
+        a = float(ma.iloc[-1])
+        b = float(ma.iloc[-(slope_lookback + 1)])
+        if b == 0:
+            return np.nan
+        return (a / b - 1.0) * 100.0  # % change over slope_lookback
+
     rows = []
     for t in tickers:
         s_d = close_d[t].dropna() if (not close_d.empty and t in close_d.columns) else pd.Series(dtype=float)
@@ -283,6 +323,14 @@ def render_intraday_rsi_screener_tab(
         ma50 = last_sma(s_d, 50)
         ma200 = last_sma(s_d, 200)
 
+        # --- New: Relative Strength vs QQQ (3M) ---
+        ret_3m = trailing_return(s_d, 63)  # ~3 months
+        qqq_3m = trailing_return(qqq_d, 63)
+        rs_vs_qqq_3m = (ret_3m - qqq_3m) * 100.0 if (pd.notna(ret_3m) and pd.notna(qqq_3m)) else np.nan  # pct points
+
+        # --- New: MA50 slope (20 trading days), percent ---
+        ma50_slope_20d = ma_slope(s_d, ma_window=50, slope_lookback=20)
+
         ref_px = float(s_d.iloc[-1]) if not s_d.empty else last_px
         above_ma200 = (pd.notna(ma200) and pd.notna(ref_px) and (ref_px > ma200))
         dist_ma200_pct = (float(ref_px) / float(ma200) - 1.0) * 100.0 if (
@@ -295,9 +343,11 @@ def render_intraday_rsi_screener_tab(
             "5m RSI (Tactical)": last_rsi(s_5),
             "MA50 (Daily)": ma50,
             "MA200 (Daily)": ma200,
-            "Above MA200?": bool(above_ma200) if (pd.notna(ma200) and pd.notna(ref_px)) else None,
+            "Above MA200?": bool(above_ma200) if (pd.notna(ma200) and pd.notna(ref_px)) else "N/A (need 200d)",
             "Dist to MA200 (%)": dist_ma200_pct,
             "Last Time": last_time,
+            "RS vs QQQ (3M, pp)": rs_vs_qqq_3m,
+            "MA50 slope (20d, %)": ma50_slope_20d,
         })
 
     screen = pd.DataFrame(rows)
@@ -388,7 +438,8 @@ def render_intraday_rsi_screener_tab(
         """
         d = row.get("Daily RSI (Swing/Trend)", np.nan)
         i5 = row.get("5m RSI (Tactical)", np.nan)
-
+        rs3m = row.get("RS vs QQQ (3M, pp)", np.nan)
+        ma50s = row.get("MA50 slope (20d, %)", np.nan)
         above200 = row.get("Above MA200?", None)
         dist200 = row.get("Dist to MA200 (%)", np.nan)
 
@@ -405,6 +456,16 @@ def render_intraday_rsi_screener_tab(
             score += 1
         elif above200 is False:
             score -= 1
+
+        # --- New: Relative Strength vs QQQ (3M) ---
+        # Positive means outperforming QQQ (leader). Negative = laggard.
+        if pd.notna(rs3m):
+            score += 1 if rs3m > 0 else -1
+
+        # --- New: MA50 slope (20d) ---
+        # Positive slope means trend is rising; negative slope = deterioration.
+        if pd.notna(ma50s):
+            score += 1 if ma50s > 0 else -1
 
         # Optional: reward “near MA200” pullbacks (better entries than buying far above)
         # Only if above MA200 and within +0%..+6% distance.
@@ -502,6 +563,8 @@ def render_intraday_rsi_screener_tab(
         "Last Price",
         "Above MA200?", "Dist to MA200 (%)",
         "Daily RSI (Swing/Trend)", "Daily State",
+        "RS vs QQQ (3M, pp)",
+        "MA50 slope (20d, %)",
         "5m RSI (Tactical)", "5m State",
         "MA50 (Daily)", "MA200 (Daily)",
         "P/E (TTM)", "P/E (Fwd)",
@@ -525,7 +588,7 @@ def render_intraday_rsi_screener_tab(
     if only_actionable:
         screen = screen[(screen["Score"] >= 3) | (screen["Score"] <= -3)]
 
-    st.caption("This table uses: Daily (6mo), 5m (5d). Thresholds apply per timeframe.")
+    st.caption("This table uses: Daily (2y), 5m (5d). Thresholds apply per timeframe.")
     st.dataframe(screen, use_container_width=True, hide_index=True)
 
     # ----------------------------
