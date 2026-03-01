@@ -558,7 +558,7 @@ def compute_thresholds_from_window(df, start, end, keys, dirs, min_points: int =
     end_dt = pd.to_datetime(end)
     w = df.loc[start_dt:end_dt].copy()
     if w.empty:
-        raise ValueError("No data in selected crisis window.")
+        return {}
 
     def q(series, p):
         s = series.dropna()
@@ -1701,6 +1701,30 @@ def run_structural(res_base: pd.DataFrame, weights_struct: dict, dirs_struct: di
 def run_crisis(res_base: pd.DataFrame, weights_crisis: dict, dirs_crisis: dict, win_start: str, win_end: str) -> tuple[pd.DataFrame, list, dict, dict, dict, dict]:
     candidate_keys = [k for k in dirs_crisis.keys() if k in weights_crisis]
     thresholds = compute_thresholds_from_window(res_base, win_start, win_end, keys=candidate_keys, dirs=dirs_crisis)
+
+    # Graceful fail (e.g. 1929 window has no overlap with our dataset)
+
+    if not thresholds:
+        avail_start = res_base.index.min()
+        avail_end = res_base.index.max()
+        st.error(
+            f"No data available in the selected crisis window ({win_start} → {win_end}).\n\n"
+            f"Available dataset range is approximately: {avail_start.date()} → {avail_end.date()}.\n\n"
+            "Pick a later crisis window (e.g., 1974/1980/2011/2020) or switch to Custom and use an overlapping range."
+        )
+        # Return a safe empty result pack so downstream UI/report doesn't crash
+        res = res_base.copy()
+        res["SIGNAL"] = np.nan
+        res["REGIME"] = "No data"
+        core_keys = []
+        dirs = {}
+        weights = {}
+        gold_stats = {
+            "3m": {"ok": False, "reason": "no-overlap"},
+            "6m": {"ok": False, "reason": "no-overlap"},
+        }
+        return res, core_keys, {}, dirs, weights, gold_stats
+
     core_keys = list(thresholds.keys())
 
     # If a historical window has sparse data (e.g., 1929–1933),
