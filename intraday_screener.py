@@ -250,11 +250,11 @@ def render_intraday_rsi_screener_tab(
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        daily_uptrend_thr = st.number_input("Daily RSI uptrend ≥", min_value=40, max_value=70, value=55, step=1)
+        daily_uptrend_thr = st.number_input("Daily RSI uptrend (bullish momentum) ≥", min_value=40, max_value=70, value=55, step=1)
     with c2:
-        daily_downtrend_thr = st.number_input("Daily RSI downtrend ≤", min_value=30, max_value=60, value=45, step=1)
+        daily_downtrend_thr = st.number_input("Daily RSI downtrend (bearish momentum) ≤", min_value=30, max_value=60, value=45, step=1)
     with c3:
-        pe_hot_thr = st.number_input("P/E hot ≥", min_value=10, max_value=200, value=80, step=5)
+        pe_hot_thr = st.number_input("P/E hot (Doesn't Worth the Money) ≥", min_value=10, max_value=200, value=80, step=5)
     with c4:
         pe_ok_thr = st.number_input("P/E OK ≤", min_value=5, max_value=150, value=60, step=5)
 
