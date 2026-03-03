@@ -1937,7 +1937,7 @@ if mode == "Market Acceleration (fast)":
 
     with k3:
         st.markdown("**RSI (Monthly)**")
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3 = st.columns([1, 1.2, 1])
         m1.metric("RSI 14M", "—" if pd.isna(rsi_last) else f"{rsi_last:.0f}")
         m2.metric("z-score (5Y)", "—" if pd.isna(rsi_z_last) else f"{rsi_z_last:+.2f}")
         m3.metric("slope (3M)", "—" if pd.isna(rsi_slope_last) else f"{rsi_slope_last:+.0f}")
@@ -2319,7 +2319,7 @@ if mode != "Market Acceleration (fast)":
 
 # --- Combined charts: (Left) RSI daily+monthly, (Right) Gold price
 if mode == "Market Acceleration (fast)":
-    tab1, tab2, tab3 = st.tabs(["Gold Acceleration", "Intraday RSI Screener (NASDAQ)", "Monte Carlo"])
+    tab1, tab2, tab3 = st.tabs(["Gold Acceleration", "Intraday RSI Screener", "Monte Carlo"])
 
     # ----------------------------
     # TAB 1: GOLD ONLY
@@ -2519,60 +2519,120 @@ if mode == "Market Acceleration (fast)":
     # TAB 3: Monte Carlo
     # ----------------------------
     with tab3:
-        if mode != "Crisis Similarity (template)":
 
-            st.subheader("Monte Carlo Outlook")
-
-            paths, reg_now = mc.monte_carlo_paths_by_regime(
-                res,
-                price_col="GOLD_USD",
-                regime_col="REGIME",
-                horizon_months=mc_h,
-                n_sims=mc_n
-            )
-
-            if paths is None:
-                st.warning("Not enough regime history for Monte Carlo.")
-
-            else:
-                bands = mc.mc_percentiles(paths)
-
-                bands = bands.rename(columns={
-                    "p10": "p10 - Only 10% of simulations end up below this level",
-                    "p50": "p50 - 50% of simulations end up below this level",
-                    "p90": "p90 - 90% of simulations end up below this level",
-                })
-
-                st.line_chart(bands)
-
-                # 👇 Interpretation MUST be inside this else block
-
-                st.markdown(f"""
-    ### How to interpret this Monte Carlo fan chart
-
-    - **p10** → downside band  
-    - **p50** → typical path  
-    - **p90** → upside band  
-    
-    1) Directional bias
-    If p50 slopes upward, the regime historically tended to produce positive drift for gold.
-    If p50 slopes downward, the regime historically had negative drift.
-    2) Risk / volatility regime
-    If the gap between p10 and p90 is wide, the regime historically had high volatility / uncertainty.
-    If it’s narrow, the regime was more stable.
-    3) Downside risk (practical)
-    Look at where p10 is after 6–12 months.
-    That’s your “bad-but-not-crazy” downside under this regime (not worst case, but stress-ish).
-    4) Upside potential
-    Look at p90 after 6–12 months.
-    That’s your “good-but-not-crazy” upside.
-
-    **Current regime used for simulation:** `{reg_now}`  
-    **Simulation horizon:** `{mc_h}` months · **Simulations:** `{mc_n}`
-    """)
-
-        else:
+        if mode == "Crisis Similarity (template)":
             st.info("Monte Carlo disabled in Crisis Similarity mode.")
+        else:
+            st.subheader("Monte Carlo — Tactical (per-ticker)")
+
+            with st.expander("### How to interpret these charts"):
+                st.markdown("""
+
+              This chart shows how gold has behaved in the past when the economy looked like it does today.
+               - The middle line (p50) shows what usually happened.
+               - The lower line  (p10) shows a realistic downside scenario.
+               - The upper line  (p90) shows a realistic upside scenario.
+              A wider band means more uncertainty. A narrower band means more stability.
+
+              **1) General Direction** — Is gold usually rising or falling in this environment?
+              p50 curve slopes upward: In similar economic conditions in the past, gold usually moved higher.  
+              p50 slopes downward: In similar conditions, gold usually moved lower.  
+              **2) Risk / volatility regime**  
+              If the gap between p10 and p90 is wide, this environment historically had high volatility / uncertainty.  
+              If it’s narrow, this environment hwas usually been calmer and more predictable.  
+              **3) Downside risk - What could go wrong?**  
+              Look at where p10 is after 6–12 months.  
+              A realistic bad outcome(worst case, not collapse not crisis), but a meaningful drop that has happened before in similar conditions.
+              **4) Upside potential** - What could go well?  
+              Look at p90 after 6–12 months.  
+              A realistic strong outcome — not a bubble or mania, but a good rally that has happened before.  
+
+              **Current regime used for simulation:** `{reg_now}`  
+              **Simulation horizon:** `{mc_h}` months · 
+              **Simulations:** `{mc_n}`
+              """)
+
+            # --- selection UI
+            left, right = st.columns([1, 3], gap="large")
+            with left:
+                overlay = st.checkbox("Overlay view (compare selected tickers)", value=True)
+                mc_steps = st.slider("Simulation horizon (bars)", 20, 250, 60, 10)
+                mc_n2 = st.slider("Simulations", 500, 5000, 2000, 500)
+
+                # Use your existing ticker universe
+                universe = list(dict.fromkeys((tickers_top10 or []) + ["GLD", "SPY", "QQQ"]))
+                universe = [t for t in universe if isinstance(t, str) and t.strip()]
+
+                if "mc_selected" not in st.session_state:
+                    st.session_state["mc_selected"] = ["GLD", "SPY"]
+
+                selected = []
+                for t in universe:
+                    if st.checkbox(t, value=(t in st.session_state["mc_selected"]), key=f"mc_cb_{t}"):
+                        selected.append(t)
+                st.session_state["mc_selected"] = selected
+
+            with right:
+                if not selected:
+                    st.info("Select tickers on the left.")
+                    st.stop()
+
+                # --- Fetch DAILY closes (2y) + build RSI + slope-based tactical state
+                # Reuse intraday_screener's yfinance helper for DAILY prices
+                close_d = intraday_screener.yf_multi_close_fixed_period(
+                    selected, interval="1d", period="2y", refresh_token=refresh_token
+                )
+
+                if close_d is None or close_d.empty:
+                    st.warning("No price data available for selected tickers.")
+                    st.stop()
+
+                p50_overlay = {}
+
+                for t in selected:
+                    px = close_d[t].dropna() if t in close_d.columns else pd.Series(dtype=float)
+                    if px.empty or px.shape[0] < 60:
+                        st.warning(f"{t}: not enough daily history for RSI/state.")
+                        continue
+
+                    r = rsi(px, period=14).dropna()
+                    r = r.reindex(px.index, method="ffill")
+                    slope = r.diff(5)  # 5 trading days slope
+                    state = pd.Series(
+                        [mc.classify_accel_state(rv, sv) for rv, sv in zip(r.values, slope.values)],
+                        index=px.index,
+                        name="STATE",
+                    )
+
+                    paths, state_now = mc.monte_carlo_paths_by_tactical_state(
+                        price=px,
+                        state=state,
+                        horizon_steps=mc_steps,
+                        n_sims=mc_n2,
+                        seed=7,
+                    )
+
+                    if paths is None:
+                        st.warning(f"{t}: not enough history in current tactical state ({state_now}).")
+                        continue
+
+                    bands = mc.mc_percentiles(paths)
+                    # store p50 for overlay
+                    p50_overlay[t] = bands["p50"].rename(t)
+
+                    if not overlay:
+                        st.markdown(f"### {t} (state: `{state_now}`)")
+                        st.line_chart(bands)
+
+                if overlay:
+                    if not p50_overlay:
+                        st.warning("Nothing to overlay (no ticker had enough state history).")
+                    else:
+                        df_overlay = pd.concat(p50_overlay.values(), axis=1)
+                        st.markdown("### Overlay (Median path only)")
+                        st.caption(
+                            "Each line is the typical (p50) simulated path under each ticker’s current tactical state.")
+                        st.line_chart(df_overlay)
 
     # ---- Gold-only panels must render ONLY in Tab1
     with tab1:
@@ -2616,8 +2676,6 @@ bear_now = globals().get("bear_now", False)
 trig_hi  = globals().get("trig_hi", 0.60)
 trig_lo  = globals().get("trig_lo", -0.60)
 persist  = globals().get("persist", 2)
-
-st.write("DEBUG: trigger defaults active", trig_hi, trig_lo, persist)
 
 trigger_info = {
 "bull_now": bull_now,

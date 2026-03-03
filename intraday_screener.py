@@ -6,6 +6,9 @@ import pandas as pd
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import streamlit as st
+from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
+
 
 def plot_candles(ax, ohlc: pd.DataFrame, title: str = ""):
     """
@@ -22,21 +25,33 @@ def plot_candles(ax, ohlc: pd.DataFrame, title: str = ""):
     width = (x[-1] - x[0]) / max(len(x), 50) * 0.8  # adaptive
 
     for xi, (o, h, l, c) in zip(x, ohlc[["Open", "High", "Low", "Close"]].to_numpy()):
+        up = (c >= o)
+        col = "green" if up else "red"
+
         # wick
-        ax.plot([xi, xi], [l, h], linewidth=1)
+        ax.plot([xi, xi], [l, h], linewidth=1, color=col)
+
         # body
         y0 = min(o, c)
         height = max(abs(c - o), 1e-9)
-        rect = plt.Rectangle((xi - width / 2, y0), width, height)
+        rect = plt.Rectangle(
+            (xi - width / 2, y0),
+            width,
+            height,
+            facecolor=col,
+            edgecolor=col,
+            linewidth=1,
+            alpha=0.9
+        )
         ax.add_patch(rect)
 
     ax.set_title(title)
     ax.xaxis_date()
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ohlc.index.tz))
     ax.grid(True, alpha=0.3)
 
-@st.cache_data(ttl=65, show_spinner=False)
+@st.cache_data(ttl=50, show_spinner=False)
 def yf_intraday_ohlc(
     ticker: str,
     interval: str = "1m",
@@ -73,11 +88,16 @@ def yf_intraday_ohlc(
         if df.empty:
             return pd.DataFrame()
 
-        # tz-naive
+        # --- Timezone handling (keep tz info; normalize) ---
         try:
-            if getattr(df.index, "tz", None) is not None:
-                df.index = df.index.tz_convert(None)
+            if getattr(df.index, "tz", None) is None:
+                # If tz-naive, assume UTC (prevents wrong NY-localize later)
+                df.index = df.index.tz_localize("UTC")
+            else:
+                # Normalize to UTC for internal consistency
+                df.index = df.index.tz_convert("UTC")
         except Exception:
+            # If anything weird happens, leave index as-is
             pass
 
         return df.sort_index()
@@ -208,7 +228,17 @@ def render_intraday_rsi_screener_tab(
     tickers: list[str],
     refresh_token: int = 0,
 ):
-    st.markdown("## Intraday RSI Screener (Top 10) — Multi-timeframe")
+    # -----------------------------
+    # Defaults (session_state)
+    # -----------------------------
+    if "use_weighted_scoring" not in st.session_state:
+        st.session_state["use_weighted_scoring"] = True
+    if "use_dynamic_weights" not in st.session_state:
+        st.session_state["use_dynamic_weights"] = True
+    if "vol_window" not in st.session_state:
+        st.session_state["vol_window"] = 20
+
+    st.markdown("## Intraday RSI Screener — Multi-timeframe")
 
     # You control the universe elsewhere (sidebar). Keep tab clean.
     tickers = [t.strip().upper() for t in (tickers or []) if t and isinstance(t, str)]
@@ -263,6 +293,45 @@ def render_intraday_rsi_screener_tab(
     # ----------------------------
     # Build the TOP-10 multi-timeframe table
     # ----------------------------
+    def realized_vol_annualized(series: pd.Series, window: int = 20) -> float:
+        """
+        Annualized realized vol (%) from daily closes using log returns.
+        """
+        if series is None or series.dropna().empty:
+            return np.nan
+        s = series.dropna().astype(float)
+        if len(s) <= window + 2:
+            return np.nan
+        rets = np.log(s).diff().dropna()
+        rv = rets.rolling(window).std(ddof=0).iloc[-1]
+        if pd.isna(rv):
+            return np.nan
+        return float(rv * np.sqrt(252.0) * 100.0)
+
+    def vol_regime(series: pd.Series, window: int = 20) -> str:
+        """
+        HIGH if current vol is meaningfully above its own recent baseline; else LOW.
+        Baseline = median vol over last ~1y (252 days) computed from rolling vols.
+        """
+        if series is None or series.dropna().empty:
+            return "N/A"
+        s = series.dropna().astype(float)
+        if len(s) < 252:
+            # not enough history to build a robust baseline
+            cur = realized_vol_annualized(s, window=window)
+            return "HIGH" if (pd.notna(cur) and cur >= 35.0) else "LOW"  # fallback heuristic
+
+        rets = np.log(s).diff().dropna()
+        roll = rets.rolling(window).std(ddof=0) * np.sqrt(252.0) * 100.0
+        roll = roll.dropna()
+        if roll.empty:
+            return "N/A"
+        cur = float(roll.iloc[-1])
+        base = float(roll.tail(252).median())
+
+        # HIGH if > +25% above baseline
+        return "HIGH" if (pd.notna(cur) and pd.notna(base) and base > 0 and cur >= 1.25 * base) else "LOW"
+
     def last_rsi(series: pd.Series) -> float:
         if series is None or series.empty or len(series) < 20:
             return np.nan
@@ -305,6 +374,9 @@ def render_intraday_rsi_screener_tab(
             return np.nan
         return (a / b - 1.0) * 100.0  # % change over slope_lookback
 
+    # --- Volatility window (use session_state, safe default) ---
+    vw = int(st.session_state.get("vol_window", 20))
+
     rows = []
     for t in tickers:
         s_d = close_d[t].dropna() if (not close_d.empty and t in close_d.columns) else pd.Series(dtype=float)
@@ -344,43 +416,157 @@ def render_intraday_rsi_screener_tab(
             "5m RSI (Tactical)": last_rsi(s_5),
             "MA50 (Daily)": ma50,
             "MA200 (Daily)": ma200,
-            "Above MA200?": bool(above_ma200) if (pd.notna(ma200) and pd.notna(ref_px)) else "N/A (need 200d)",
+            "Above MA200?": (bool(above_ma200) if (pd.notna(ma200) and pd.notna(ref_px)) else None),
             "Dist to MA200 (%)": dist_ma200_pct,
             "Last Time": last_time,
             "RS vs QQQ (3M, pp)": rs_vs_qqq_3m,
             "MA50 slope (20d, %)": ma50_slope_20d,
+            "Realized Vol (ann %, daily)": realized_vol_annualized(s_d, window=vw),
+            "Vol Regime": vol_regime(s_d, window=vw),
         })
 
     screen = pd.DataFrame(rows)
 
+    # ----------------------------
+    # Multi-select (checkboxes) + overlay view
+    # ----------------------------
+    st.markdown("### Chart selection")
+
+    MAX_SELECTED = 8
+
+    left, right = st.columns([1, 3], gap="large")
+
+    with left:
+        overlay = st.checkbox("Overlay view (compare tickers on one chart)", value=False)
+        metric = st.selectbox("Metric", ["RSI (Daily)", "RSI (5m)", "Price (normalized)"], index=0)
+
+        st.caption("Select tickers (multiple).")
+        if "rsi_screener_selected" not in st.session_state:
+            # default: first 3 tickers
+            st.session_state["rsi_screener_selected"] = screen["Ticker"].tolist()[:3]
+
+        selected = []
+        for t in screen["Ticker"].tolist():
+            checked = st.checkbox(t, value=(t in st.session_state["rsi_screener_selected"]), key=f"cb_{t}")
+            if checked:
+                selected.append(t)
+
+        if len(selected) > MAX_SELECTED:
+            st.warning(f"Select up to {MAX_SELECTED} tickers.")
+            selected = selected[:MAX_SELECTED]
+
+        st.session_state["rsi_screener_selected"] = selected
+
+    with right:
+        if not selected:
+            st.info("Select one or more tickers on the left.")
+        else:
+            # Build overlay dataframe
+            series_map = {}
+            for t in selected:
+                s_d = close_d[t].dropna() if (not close_d.empty and t in close_d.columns) else pd.Series(dtype=float)
+                s_5 = close_5[t].dropna() if (not close_5.empty and t in close_5.columns) else pd.Series(dtype=float)
+
+                if metric == "RSI (Daily)":
+                    r = rsi_func(s_d.astype(float), period=14).dropna()
+                    series_map[t] = r.rename(t)
+                elif metric == "RSI (5m)":
+                    r = rsi_func(s_5.astype(float), period=14).dropna()
+                    series_map[t] = r.rename(t)
+                else:
+                    # Normalize price so overlay makes sense
+                    px = s_d.astype(float).dropna()
+                    if not px.empty:
+                        px = px / float(px.iloc[0]) * 100.0
+                    series_map[t] = px.rename(t)
+
+            overlay_df = pd.concat(series_map.values(), axis=1).dropna(how="all")
+
+            if overlay:
+                st.line_chart(overlay_df)
+            else:
+                for t in selected:
+                    st.markdown(f"**{t}**")
+                    st.line_chart(overlay_df[[t]].dropna())
+
+    # ----------------------------
+    # OPTIONAL: Live candlesticks for ONE ticker (kept, but now driven by selection)
+    # ----------------------------
     st.markdown("### Live candlesticks (optional)")
+    show_candles = st.checkbox("Show live candlesticks (single ticker)", value=False)
 
-    show_candles = st.checkbox("Show live candlesticks for selected ticker", value=False)
+    if show_candles:
+        pick = selected[0] if selected else screen["Ticker"].iloc[0]
 
-    pick = st.selectbox("Ticker to display", screen["Ticker"].tolist(), index=0)
+        st_autorefresh(interval=60 * 1000, key="candles_autorefresh")
 
-    # Use 1m bars for live feel; fallback to 5m if empty
-    if show_candles and pick:
         ohlc_1m = yf_intraday_ohlc(pick, interval="1m", period="1d", refresh_token=refresh_token)
-        ohlc = ohlc_1m
+        ohlc = ohlc_1m if not ohlc_1m.empty else yf_intraday_ohlc(
+            pick, interval="5m", period="5d", refresh_token=refresh_token
+        )
 
-        if ohlc.empty:
-            ohlc_5m = yf_intraday_ohlc(pick, interval="5m", period="5d", refresh_token=refresh_token)
-            ohlc = ohlc_5m
-
-        # Window: last 2 hours for 1m, last 2 days for 5m
         if not ohlc.empty:
             end = ohlc.index.max()
-            if (ohlc.index.freqstr == "T") or (len(ohlc) > 300):
-                start = end - pd.Timedelta(hours=2)
-            else:
-                start = end - pd.Timedelta(days=2)
+            start = end - (pd.Timedelta(hours=2) if len(ohlc) > 300 else pd.Timedelta(days=2))
             ohlc = ohlc.loc[ohlc.index >= start]
 
+            # ---- Compute both times for display (ET + Athens) ----
+            ts = ohlc.index.max()
+            # ts should be UTC now (from yf_intraday_ohlc), but keep it robust:
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.tz_localize("UTC")
+
+            ts_et = ts.tz_convert("America/New_York")
+            ts_ath = ts.tz_convert("Europe/Athens")
+
+            us_last = ts_et.strftime("%H:%M")
+            gr_last = ts_ath.strftime("%H:%M")
+        else:
+            us_last = "—"
+            gr_last = "—"
+
+        title = f"{pick} Candles | US ET: {us_last} | Athens: {gr_last}"
+
         fig, ax = plt.subplots(figsize=(12.0, 3.6))
-        plot_candles(ax, ohlc, title=f"{pick} Candles (auto-refresh driven)")
+
+        ohlc_plot = ohlc.copy()
+        if not ohlc_plot.empty:
+            if getattr(ohlc_plot.index, "tz", None) is None:
+                ohlc_plot.index = ohlc_plot.index.tz_localize("UTC")
+            ohlc_plot.index = ohlc_plot.index.tz_convert("America/New_York")
+
+        plot_candles(ax, ohlc_plot, title=title)
+
         fig.autofmt_xdate(rotation=0)
         st.pyplot(fig, use_container_width=True)
+
+        # App refresh time (local runtime)
+        app_now = datetime.now().strftime("%H:%M:%S")
+
+        # Latest candle time (display in US ET)
+        if not ohlc.empty:
+            ts = ohlc.index.max()
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.tz_localize("UTC")
+            ts_et = ts.tz_convert("America/New_York")
+            last_bar_et = ts_et.strftime("%H:%M:%S")
+        else:
+            last_bar_et = "—"
+
+        st.markdown(
+            f"<div style='display:flex; justify-content:space-between; font-size:0.85rem; color:gray;'>"
+            f"<span>App refreshed (local): {app_now}</span>"
+            f"<span>Latest candle (US ET): {last_bar_et}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            f"<div style='text-align: right; font-size: 0.85rem; color: gray;'>"
+            f"Last updated (US ET): {last_bar_et}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
 
     # Merge valuation snapshot (P/E)
@@ -433,99 +619,133 @@ def render_intraday_rsi_screener_tab(
         return float(pe) if pd.notna(pe) else np.nan
 
     def _score_row(row) -> tuple[int, str]:
+
         """
-        Returns (score, setup_label).
-        score roughly in [-5, +5]. Positive = buy-leaning, negative = sell-leaning.
+        Returns (score_int, setup_label).
+
+        - If weighted scoring is OFF: behaves like your original point system.
+        - If weighted scoring is ON: builds Trend/Timing/Valuation components, combines via weights,
+          then rounds into an integer Score so your existing verdict mapping stays unchanged.
         """
+
+        # --- read scoring engine settings from session_state ---
+        use_weighted_scoring = bool(st.session_state.get("use_weighted_scoring", True))
+        use_dynamic_weights = bool(st.session_state.get("use_dynamic_weights", True))
+
         d = row.get("Daily RSI (Swing/Trend)", np.nan)
         i5 = row.get("5m RSI (Tactical)", np.nan)
         rs3m = row.get("RS vs QQQ (3M, pp)", np.nan)
         ma50s = row.get("MA50 slope (20d, %)", np.nan)
         above200 = row.get("Above MA200?", None)
         dist200 = row.get("Dist to MA200 (%)", np.nan)
-
         pe = _safe_pe(row)
+        vreg = row.get("Vol Regime", "N/A")
 
-        if pd.isna(d) or pd.isna(i5):
+        if pd.isna(d):
             return (0, "NO DATA")
 
-        score = 0
+        i5_missing = pd.isna(i5)
+
+        # -----------------------
+        # Component scores
+        # -----------------------
+        trend = 0.0
+        timing = 0.0
+        value = 0.0
 
         # --- Trend filter (MA200) ---
-        # If MA200 is available, use it as regime context.
         if above200 is True:
-            score += 1
+            trend += 1
         elif above200 is False:
-            score -= 1
+            trend -= 1
 
-        # --- New: Relative Strength vs QQQ (3M) ---
-        # Positive means outperforming QQQ (leader). Negative = laggard.
+        # --- Relative Strength vs QQQ (3M) ---
         if pd.notna(rs3m):
-            score += 1 if rs3m > 0 else -1
+            trend += 1 if rs3m > 0 else -1
 
-        # --- New: MA50 slope (20d) ---
-        # Positive slope means trend is rising; negative slope = deterioration.
+        # --- MA50 slope (20d) ---
         if pd.notna(ma50s):
-            score += 1 if ma50s > 0 else -1
+            trend += 1 if ma50s > 0 else -1
 
-        # Optional: reward “near MA200” pullbacks (better entries than buying far above)
-        # Only if above MA200 and within +0%..+6% distance.
+        # --- Near MA200 pullback bonus ---
         if above200 is True and pd.notna(dist200) and 0 <= dist200 <= 6:
-            score += 1
+            trend += 1
 
-        setup = "NEUTRAL"
-
-        # --- Trend context (Daily RSI) ---
+        # --- Daily RSI momentum context ---
         if d >= daily_uptrend_thr:
-            score += 1
+            trend += 1
         if d >= daily_uptrend_thr + 5:
-            score += 1  # stronger uptrend
+            trend += 1
         if d <= daily_downtrend_thr:
-            score -= 1
+            trend -= 1
         if d <= daily_downtrend_thr - 5:
-            score -= 1  # stronger downtrend
+            trend -= 1
 
         # --- Timing pulse (5m RSI) ---
-        # Oversold helps BUY timing; overbought helps SELL timing
-        if i5 <= thr_oversold:
-            score += 2
-        elif i5 <= (thr_oversold + 10):
-            score += 1
+        if not i5_missing:
+            if i5 <= thr_oversold:
+                timing += 2
+            elif i5 <= (thr_oversold + 10):
+                timing += 1
 
-        if i5 >= thr_overbought:
-            score -= 2
-        elif i5 >= (thr_overbought - 10):
-            score -= 1
+            if i5 >= thr_overbought:
+                timing -= 2
+            elif i5 >= (thr_overbought - 10):
+                timing -= 1
 
-        # Extreme bands (optional)
-        if show_extremes:
-            if i5 <= 15:
-                score += 1
-            if i5 >= 85:
-                score -= 1
-
-        # --- Setup label (pattern recognition) ---
-        # Tightened with MA200 trend context:
-        # - Only call it "pullback in uptrend" if ABOVE MA200
-        # - Only call it "bounce in downtrend" if BELOW MA200
-        if (above200 is True) and (d >= daily_uptrend_thr) and (i5 <= thr_oversold):
-            setup = "PULLBACK_UPTREND"
-        elif (above200 is False) and (d <= daily_downtrend_thr) and (i5 >= thr_overbought):
-            setup = "BOUNCE_DOWNTREND"
-        elif (d >= daily_uptrend_thr + 5) and (40 <= i5 <= 60):
-            setup = "TREND_CONTINUATION"
-        else:
-            setup = "MIXED"
+            if show_extremes:
+                if i5 <= 15:
+                    timing += 1
+                if i5 >= 85:
+                    timing -= 1
 
         # --- Valuation guardrails (soft) ---
-        # Don’t kill the signal if PE is missing, but penalize obvious mania.
         if pd.notna(pe):
             if pe >= pe_hot_thr:
-                score -= 2
+                value -= 2
             elif pe <= pe_ok_thr:
-                score += 1
+                value += 1
 
-        return (int(score), setup)
+        # -----------------------
+        # Setup label (unchanged logic)
+        # -----------------------
+        setup = "MIXED"
+        if (above200 is True) and (d >= daily_uptrend_thr) and (not i5_missing) and (i5 <= thr_oversold):
+            setup = "PULLBACK_UPTREND"
+        elif (above200 is False) and (d <= daily_downtrend_thr) and (not i5_missing) and (i5 >= thr_overbought):
+            setup = "BOUNCE_DOWNTREND"
+        elif (d >= daily_uptrend_thr + 5) and (not i5_missing) and (40 <= i5 <= 60):
+            setup = "TREND_CONTINUATION"
+
+        # -----------------------
+        # Combine into final score
+        # -----------------------
+        if not use_weighted_scoring:
+            # Old behavior (equal-ish points): just sum components
+            score_float = trend + timing + value
+        else:
+            # Base weights
+            # Trend is the slow filter, Timing is entry/exit pulse, Value is sanity check.
+            w_trend, w_timing, w_value = 0.50, 0.35, 0.15
+
+            # Dynamic regime shift
+            if use_dynamic_weights and vreg in ("HIGH", "LOW"):
+                if vreg == "HIGH":
+                    w_trend, w_timing, w_value = 0.45, 0.45, 0.10
+                else:  # LOW
+                    w_trend, w_timing, w_value = 0.55, 0.25, 0.20
+
+            score_float = (w_trend * trend) + (w_timing * timing) + (w_value * value)
+
+            # Scale to feel similar to the old score magnitude (optional but helpful):
+            # Old sums often ranged ~[-6..+6]; weighted tends to compress.
+            score_float *= 1.6
+
+        # IMPORTANT: keep verdict mapping intact -> integer score
+        score_int = int(np.round(score_float))
+        score_int = int(np.clip(score_int, -6, 6))  # safety clamp
+
+        return (score_int, setup)
 
     def _verdict_from(score: int, setup: str) -> str:
         """Human label derived from numeric score + setup type."""
@@ -561,6 +781,7 @@ def render_intraday_rsi_screener_tab(
 
     preferred_cols = [
         "Ticker", "Score", "Verdict", "Setup",
+        "Vol Regime", "Realized Vol (ann %, daily)",
         "Last Price",
         "Above MA200?", "Dist to MA200 (%)",
         "Daily RSI (Swing/Trend)", "Daily State",
@@ -584,6 +805,34 @@ def render_intraday_rsi_screener_tab(
     cB.metric("Top Score", f"{svals.max():.0f}" if len(svals) else "—")
     cC.metric("Bottom Score", f"{svals.min():.0f}" if len(svals) else "—")
     cD.metric("BUY / SELL", f"{(screen['Score'] >= 3).sum()} / {(screen['Score'] <= -3).sum()}")
+
+    st.markdown("### Scoring engine")
+
+    sA, sB, sC = st.columns([1.2, 1.4, 1.8])
+
+    with sA:
+        st.checkbox(
+            "Use weighted scoring (instead of equal-weight points)",
+            key="use_weighted_scoring",
+            help="Keeps the same verdict mapping, but converts signals into Trend/Timing/Valuation components with weights."
+        )
+
+    with sB:
+        st.checkbox(
+            "Dynamic weights by volatility regime",
+            key="use_dynamic_weights",
+            disabled=(not st.session_state["use_weighted_scoring"]),
+            help="If enabled, tickers in high-vol regime get more weight on Timing (5m RSI) and less on Valuation."
+        )
+
+    with sC:
+        st.number_input(
+            "Volatility window (days)",
+            min_value=10, max_value=60, step=5,
+            key="vol_window",
+            disabled=(not st.session_state["use_weighted_scoring"]),
+            help="Used to classify HIGH vs LOW volatility using daily realized volatility."
+        )
 
     only_actionable = st.checkbox("Show only actionable (Score ≥ 3: Buy or ≤ -3: Sell)", value=False)
     if only_actionable:
