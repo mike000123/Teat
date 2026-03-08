@@ -2,33 +2,37 @@
 import numpy as np
 import pandas as pd
 
-def classify_accel_state(rsi_val: float, rsi_slope: float) -> str:
-    """
-    Very simple tactical state classifier.
-    You can refine thresholds later.
-    """
+
+
+def classify_accel_state(rsi_val, rsi_slope, above_ma200, rs_vs_qqq_3m, ma50_slope_20d, vol_regime
+):
     if pd.isna(rsi_val):
         return "UNKNOWN"
 
-    # Momentum direction from slope
-    if pd.isna(rsi_slope):
-        slope_bucket = "FLAT"
-    elif rsi_slope >= 2:
-        slope_bucket = "UP"
-    elif rsi_slope <= -2:
-        slope_bucket = "DOWN"
-    else:
-        slope_bucket = "FLAT"
+    bull_trend = (above_ma200 is True) and pd.notna(ma50_slope_20d) and (ma50_slope_20d > 0)
+    bear_trend = (above_ma200 is False) and pd.notna(ma50_slope_20d) and (ma50_slope_20d < 0)
+    leader = pd.notna(rs_vs_qqq_3m) and (rs_vs_qqq_3m > 0)
+    high_vol = str(vol_regime).upper() == "HIGH"
 
-    # Level bucket
-    if rsi_val >= 60:
-        level = "STRONG"
-    elif rsi_val <= 40:
-        level = "WEAK"
+    if bull_trend and leader:
+        if rsi_val <= 45:
+            core = "BULL_PULLBACK"
+        elif rsi_slope >= 2:
+            core = "BULL_CONTINUATION"
+        else:
+            core = "BULL_MATURE"
+    elif bear_trend and (not leader):
+        if rsi_val >= 55:
+            core = "BEAR_BOUNCE"
+        elif rsi_slope <= -2:
+            core = "BEAR_CONTINUATION"
+        else:
+            core = "BEAR_WEAK"
     else:
-        level = "NEUTRAL"
+        core = "MIXED"
 
-    return f"{level}_{slope_bucket}"
+    vol = "HIGHVOL" if high_vol else "LOWVOL"
+    return f"{core}_{vol}"
 
 
 def monte_carlo_paths_by_tactical_state(
@@ -61,6 +65,92 @@ def monte_carlo_paths_by_tactical_state(
     rng = np.random.default_rng(seed)
     rets = rng.choice(pool.values, size=(n_sims, horizon_steps), replace=True)
     paths = start_price * np.cumprod(1.0 + rets, axis=1)
+    return paths, state_now
+
+def monte_carlo_paths_by_tactical_state_block(
+    price: pd.Series,
+    state: pd.Series,
+    state_now: str | None = None,
+    horizon_steps: int = 60,
+    n_sims: int = 2000,
+    block_size: int = 5,
+    seed: int = 7,
+):
+    """
+    Block-bootstrap Monte Carlo.
+    Samples contiguous blocks of returns (default 5 bars) from historical periods
+    where the tactical state matches `state_now`.
+
+    This preserves some short-term momentum/mean-reversion structure better than
+    single-step bootstrap.
+
+    Parameters
+    ----------
+    price : pd.Series
+        Price series (daily or intraday).
+    state : pd.Series
+        Tactical state label aligned to the same index as price.
+    state_now : str | None
+        Current state to condition on. If None, uses latest state.
+    horizon_steps : int
+        Number of future bars to simulate.
+    n_sims : int
+        Number of Monte Carlo paths.
+    block_size : int
+        Number of consecutive returns per sampled block.
+    seed : int
+        RNG seed.
+
+    Returns
+    -------
+    paths : np.ndarray | None
+        Shape (n_sims, horizon_steps), simulated price paths.
+    state_now : str
+        State used for conditioning.
+    """
+    px = price.dropna().astype(float).copy()
+    stt = state.reindex(px.index).astype(str)
+
+    tmp = pd.DataFrame({"PX": px, "STATE": stt})
+    tmp["RET_1"] = tmp["PX"].pct_change()
+
+    if state_now is None:
+        state_now = str(tmp["STATE"].iloc[-1])
+
+    # Keep only rows in the matching state
+    tmp_state = tmp.loc[tmp["STATE"] == str(state_now)].copy()
+    ret_series = tmp_state["RET_1"].dropna()
+
+    if ret_series.empty or len(ret_series) < max(block_size * 3, 20):
+        return None, state_now
+
+    rets = ret_series.to_numpy()
+    n = len(rets)
+
+    # Build overlapping contiguous blocks
+    blocks = []
+    for i in range(0, n - block_size + 1):
+        blk = rets[i:i + block_size]
+        if len(blk) == block_size and np.isfinite(blk).all():
+            blocks.append(blk)
+
+    if not blocks:
+        return None, state_now
+
+    blocks = np.array(blocks)
+    start_price = float(tmp["PX"].iloc[-1])
+
+    rng = np.random.default_rng(seed)
+    n_blocks_needed = int(np.ceil(horizon_steps / block_size))
+
+    paths = np.empty((n_sims, horizon_steps), dtype=float)
+
+    for s in range(n_sims):
+        chosen_idx = rng.integers(0, len(blocks), size=n_blocks_needed)
+        sim_rets = blocks[chosen_idx].reshape(-1)[:horizon_steps]
+        sim_path = start_price * np.cumprod(1.0 + sim_rets)
+        paths[s, :] = sim_path
+
     return paths, state_now
 
 def monte_carlo_paths_by_regime(

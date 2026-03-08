@@ -1,14 +1,45 @@
 # intraday_screener.py
 from __future__ import annotations
-
+from plotly_charts import line_overlay, normalized_price_overlay, candlesticks
 import numpy as np
 import pandas as pd
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import streamlit as st
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
+from ui_themes import THEMES, DEFAULT_POLISHED, apply_theme, style_signal_table
+import streamlit as st
 
+def style_signal_table(df, theme):
+    """
+    Apply color styling to signal columns.
+    Bullish → green
+    Bearish → red
+    Neutral → gray
+    """
+
+    def color_signal(val):
+        if val is None:
+            return ""
+
+        v = str(val).lower()
+
+        if "bull" in v or "buy" in v or "long" in v:
+            return f"color: {theme.success}; font-weight:700"
+        elif "bear" in v or "sell" in v or "short" in v:
+            return f"color: {theme.danger}; font-weight:700"
+        elif "neutral" in v or "hold" in v:
+            return f"color: {theme.neutral}; font-weight:700"
+
+        return ""
+
+    # apply to every column that looks like a signal column
+    signal_cols = [c for c in df.columns if "signal" in c.lower()]
+
+    if not signal_cols:
+        return df.style
+
+    return df.style.applymap(color_signal, subset=signal_cols)
 
 def plot_candles(ax, ohlc: pd.DataFrame, title: str = ""):
     """
@@ -26,7 +57,17 @@ def plot_candles(ax, ohlc: pd.DataFrame, title: str = ""):
 
     for xi, (o, h, l, c) in zip(x, ohlc[["Open", "High", "Low", "Close"]].to_numpy()):
         up = (c >= o)
-        col = "green" if up else "red"
+        # read current theme (fallbacks if not applied yet)
+        theme_name = st.session_state.get("ui_theme_name", "Polished (Light)")
+        # If you prefer: pass theme explicitly into plot_candles instead of reading session_state
+        col_up = "#16A34A"
+        col_down = "#DC2626"
+        if "Bloomberg" in theme_name:
+            col_up, col_down = "#34D399", "#F87171"
+        elif "TradingView" in theme_name:
+            col_up, col_down = "#22C55E", "#EF4444"
+
+        col = col_up if up else col_down
 
         # wick
         ax.plot([xi, xi], [l, h], linewidth=1, color=col)
@@ -51,17 +92,13 @@ def plot_candles(ax, ohlc: pd.DataFrame, title: str = ""):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ohlc.index.tz))
     ax.grid(True, alpha=0.3)
 
-@st.cache_data(ttl=50, show_spinner=False)
-def yf_intraday_ohlc(
-    ticker: str,
-    interval: str = "1m",
-    period: str = "1d",
-    refresh_token: int = 0,
-) -> pd.DataFrame:
+@st.cache_data(ttl=15, show_spinner=False)
+def yf_intraday_ohlc(ticker: str, interval: str, period: str, refresh_token: int = 0) -> pd.DataFrame:
     """
-    Best-effort OHLC for candlesticks.
-    Cached very briefly; refresh_token can bust cache on schedule.
+    Download intraday OHLC data using yfinance.
+    Returns a clean DataFrame with columns: Open, High, Low, Close.
     """
+
     try:
         import yfinance as yf
     except Exception:
@@ -75,35 +112,72 @@ def yf_intraday_ohlc(
             progress=False,
             auto_adjust=False,
             prepost=False,
+            threads=False,
         )
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        # Standardize columns
-        needed = ["Open", "High", "Low", "Close"]
-        if not all(c in df.columns for c in needed):
-            return pd.DataFrame()
-
-        df = df[needed].dropna()
-        if df.empty:
-            return pd.DataFrame()
-
-        # --- Timezone handling (keep tz info; normalize) ---
-        try:
-            if getattr(df.index, "tz", None) is None:
-                # If tz-naive, assume UTC (prevents wrong NY-localize later)
-                df.index = df.index.tz_localize("UTC")
-            else:
-                # Normalize to UTC for internal consistency
-                df.index = df.index.tz_convert("UTC")
-        except Exception:
-            # If anything weird happens, leave index as-is
-            pass
-
-        return df.sort_index()
-
     except Exception:
         return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Handle MultiIndex columns sometimes returned by yfinance
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.loc[:, ["Open", "High", "Low", "Close"]]
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        except Exception:
+            return pd.DataFrame()
+
+    needed = ["Open", "High", "Low", "Close"]
+    if not all(c in df.columns for c in needed):
+        return pd.DataFrame()
+
+    df = df[needed].copy()
+
+    # Ensure numeric OHLC
+    for c in needed:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Ensure sorted unique index
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+
+    return df
+
+import math
+
+def _yf_period_from_days(days: int) -> str:
+    """
+    Convert 'days' to a yfinance-compatible period string.
+    Examples: 5 -> "5d", 60 -> "60d", 90 -> "3mo", 400 -> "2y"
+    """
+    days = int(max(1, days))
+    if days <= 60:
+        return f"{days}d"
+    if days <= 365:
+        mo = int(math.ceil(days / 30.0))
+        return f"{mo}mo"
+    yrs = int(math.ceil(days / 365.0))
+    return f"{yrs}y"
+
+
+def _choose_intraday_interval(days: int) -> str:
+    """
+    Choose a readable intraday interval based on requested lookback days.
+    (Avoids 1m over long spans which often returns empty.)
+    """
+    days = int(max(1, days))
+    if days <= 2:
+        return "1m"
+    if days <= 10:
+        return "5m"
+    if days <= 30:
+        return "15m"
+    return "60m"
 
 @st.cache_data(ttl=65, show_spinner=False)
 def yf_multi_close_fixed_period(
@@ -231,12 +305,19 @@ def render_intraday_rsi_screener_tab(
     # -----------------------------
     # Defaults (session_state)
     # -----------------------------
+    theme = THEMES.get(st.session_state.get("ui_theme_name", DEFAULT_POLISHED.name), DEFAULT_POLISHED)
+    apply_theme(theme)
+
     if "use_weighted_scoring" not in st.session_state:
         st.session_state["use_weighted_scoring"] = True
     if "use_dynamic_weights" not in st.session_state:
         st.session_state["use_dynamic_weights"] = True
     if "vol_window" not in st.session_state:
         st.session_state["vol_window"] = 20
+
+    # -----------------------------
+    # Theme selector
+    # -----------------------------
 
     st.markdown("## Intraday RSI Screener — Multi-timeframe")
 
@@ -289,6 +370,7 @@ def render_intraday_rsi_screener_tab(
     with c4:
         pe_ok_thr = st.number_input("P/E OK ≤", min_value=5, max_value=150, value=60, step=5)
 
+    st.markdown("## Intraday RSI Screener — Multi-timeframe")
 
     # ----------------------------
     # Build the TOP-10 multi-timeframe table
@@ -482,15 +564,52 @@ def render_intraday_rsi_screener_tab(
 
             overlay_df = pd.concat(series_map.values(), axis=1).dropna(how="all")
 
+            is_rsi = metric in ("RSI (Daily)", "RSI (5m)")
+
             if overlay:
-                st.line_chart(overlay_df)
+                if metric == "Price (normalized)":
+                    fig = normalized_price_overlay(
+                        overlay_df,
+                        title=f"{metric} — Overlay",
+                        theme=theme,
+                        height=420,
+                    )
+                else:
+                    fig = line_overlay(
+                        overlay_df,
+                        title=f"{metric} — Overlay",
+                        theme=theme,
+                        y_title=metric,
+                        rsi_bands=is_rsi,
+                        show_extremes=show_extremes,
+                        height=420,
+                    )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
             else:
                 for t in selected:
                     st.markdown(f"**{t}**")
-                    st.line_chart(overlay_df[[t]].dropna())
+                    sub = overlay_df[[t]].dropna()
+                    if metric == "Price (normalized)":
+                        fig = normalized_price_overlay(
+                            sub,
+                            title=f"{t} — {metric}",
+                            theme=theme,
+                            height=360,
+                        )
+                    else:
+                        fig = line_overlay(
+                            sub,
+                            title=f"{t} — {metric}",
+                            theme=theme,
+                            y_title=metric,
+                            rsi_bands=is_rsi,
+                            show_extremes=show_extremes,
+                            height=360,
+                        )
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
 
     # ----------------------------
-    # OPTIONAL: Live candlesticks for ONE ticker (kept, but now driven by selection)
+    # OPTIONAL: Live candlesticks for ONE ticker (driven by sidebar intraday lookback)
     # ----------------------------
     st.markdown("### Live candlesticks (optional)")
     show_candles = st.checkbox("Show live candlesticks (single ticker)", value=False)
@@ -498,47 +617,90 @@ def render_intraday_rsi_screener_tab(
     if show_candles:
         pick = selected[0] if selected else screen["Ticker"].iloc[0]
 
+        # Use the GLOBAL sidebar setting (falls back safely if not set)
+        lookback_days = int(st.session_state.get("intraday_lookback_days", 5))
+
+        # UX toggle: show full requested window (default) vs just last trading day (cleaner)
+        show_last_day_only = st.checkbox("Show only last trading day (cleaner)", value=False)
+
+        # Auto-refresh the candlestick area only
         st_autorefresh(interval=60 * 1000, key="candles_autorefresh")
 
-        ohlc_1m = yf_intraday_ohlc(pick, interval="1m", period="1d", refresh_token=refresh_token)
-        ohlc = ohlc_1m if not ohlc_1m.empty else yf_intraday_ohlc(
-            pick, interval="5m", period="5d", refresh_token=refresh_token
-        )
+        # Use GLOBAL sidebar settings
+        lookback_days = int(st.session_state.get("intraday_lookback_days", 5))
+        user_interval = st.session_state.get("intraday_interval", "5m")  # ✅ comes from Patch A
 
+        # Convert lookback days to a yfinance period
+        period = _yf_period_from_days(lookback_days)
+
+        # Start with the user's choice, then fall back to known-good combos (v1-like)
+        tries = [
+            (user_interval, period),
+            ("1m", "1d"),
+            ("5m", "5d"),
+            ("15m", _yf_period_from_days(min(lookback_days, 60))),
+            ("60m", _yf_period_from_days(min(lookback_days, 730))),
+        ]
+
+        ohlc = pd.DataFrame()
+        for itv, per in tries:
+            ohlc = yf_intraday_ohlc(pick, interval=itv, period=per, refresh_token=refresh_token)
+            if ohlc is not None and not ohlc.empty:
+                interval, period = itv, per  # keep what worked
+                break
+
+        ohlc = pd.DataFrame()
+        for itv, per in tries:
+            ohlc = yf_intraday_ohlc(pick, interval=itv, period=per, refresh_token=refresh_token)
+            if ohlc is not None and not ohlc.empty:
+                interval, period = itv, per  # keep what worked
+                break
+
+        st.caption(f"Fetch used: interval={interval}, period={period}, rows={len(ohlc)}")
+
+        # Build display title times (ET + Athens) based on latest candle in returned data
         if not ohlc.empty:
-            end = ohlc.index.max()
-            start = end - (pd.Timedelta(hours=2) if len(ohlc) > 300 else pd.Timedelta(days=2))
-            ohlc = ohlc.loc[ohlc.index >= start]
-
-            # ---- Compute both times for display (ET + Athens) ----
             ts = ohlc.index.max()
-            # ts should be UTC now (from yf_intraday_ohlc), but keep it robust:
             if getattr(ts, "tzinfo", None) is None:
                 ts = ts.tz_localize("UTC")
-
             ts_et = ts.tz_convert("America/New_York")
             ts_ath = ts.tz_convert("Europe/Athens")
-
             us_last = ts_et.strftime("%H:%M")
             gr_last = ts_ath.strftime("%H:%M")
         else:
             us_last = "—"
             gr_last = "—"
 
-        title = f"{pick} Candles | US ET: {us_last} | Athens: {gr_last}"
+        title = f"{pick} Candles ({interval}, {period}) | US ET: {us_last} | Athens: {gr_last}"
 
-        fig, ax = plt.subplots(figsize=(12.0, 3.6))
-
+        # Convert to ET for plotting (Plotly expects datetime index)
         ohlc_plot = ohlc.copy()
         if not ohlc_plot.empty:
             if getattr(ohlc_plot.index, "tz", None) is None:
                 ohlc_plot.index = ohlc_plot.index.tz_localize("UTC")
             ohlc_plot.index = ohlc_plot.index.tz_convert("America/New_York")
 
-        plot_candles(ax, ohlc_plot, title=title)
+            # If user prefers: keep only the last trading day (prevents “flat empty” feeling off-hours)
+            if show_last_day_only:
+                last_day = ohlc_plot.index.max().date()
+                day_df = ohlc_plot[ohlc_plot.index.date == last_day]
+                if not day_df.empty:
+                    ohlc_plot = day_df
 
-        fig.autofmt_xdate(rotation=0)
-        st.pyplot(fig, use_container_width=True)
+        st.caption(f"OHLC rows={len(ohlc_plot)} | cols={list(ohlc_plot.columns)} | dtypes={ohlc_plot.dtypes.to_dict()}")
+
+        fig = candlesticks(
+            ohlc_plot,
+            title=title,
+            theme=theme,
+            height=360,
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"displayModeBar": True, "scrollZoom": True},
+        )
 
         # App refresh time (local runtime)
         app_now = datetime.now().strftime("%H:%M:%S")
@@ -839,7 +1001,8 @@ def render_intraday_rsi_screener_tab(
         screen = screen[(screen["Score"] >= 3) | (screen["Score"] <= -3)]
 
     st.caption("This table uses: Daily (2y), 5m (5d). Thresholds apply per timeframe.")
-    st.dataframe(screen, use_container_width=True, hide_index=True)
+    styled = style_signal_table(screen, theme)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # ----------------------------
     # Basic overview stats (per timeframe)
