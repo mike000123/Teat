@@ -289,8 +289,8 @@ def build_portfolio_backtest(
     exec_action = pd.Series(df["confirmed_action"]).shift(lag).fillna("WATCH")
     exec_size = pd.Series(raw_sizes).shift(lag).fillna(raw_sizes.iloc[0] if len(raw_sizes) else 100.0)
 
-    equity = float(100.0)
-    benchmark = float(100.0)
+    equity = float(initial_capital)
+    benchmark = float(initial_capital)
 
     applied_positions = []
     next_positions = []

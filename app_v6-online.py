@@ -3297,7 +3297,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
         # ----------------------------
         # Core replay settings
         # ----------------------------
-        b1, b2, b3, b4 = st.columns(4)
+        b1, b2, b3, b4, b5 = st.columns(5)
         with b1:
             min_bt_date = pd.to_datetime(res_base.index.min()).date() if len(res_base.index) else datetime(1975, 1,
                                                                                                            1).date()
@@ -3325,6 +3325,18 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 [c for c in ["GOLD_USD", "GLD"] if c in res_base.columns] or ["GOLD_USD"],
                 index=0,
                 key="bt_price_col",
+            )
+
+        with b5:
+            bt_initial_capital = float(
+                st.number_input(
+                    "Initial investment",
+                    min_value=100.0,
+                    max_value=100000000.0,
+                    value=10000.0,
+                    step=100.0,
+                    key="bt_initial_capital",
+                )
             )
 
         simple_explainer("What forward horizon means", """
@@ -3612,6 +3624,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
 
         portfolio_df = build_portfolio_backtest(
             bt_df,
+            initial_capital=float(bt_initial_capital),
             trading_mode=bt_trading_mode,
             transaction_cost_bps=float(bt_tc_bps),
             slippage_bps=float(bt_slip_bps),
@@ -3654,6 +3667,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
 
             compare_portfolio_df = build_portfolio_backtest(
                 compare_bt_df,
+                initial_capital=float(bt_initial_capital),
                 trading_mode=compare_trading_mode,
                 transaction_cost_bps=float(compare_tc_bps),
                 slippage_bps=float(compare_slip_bps),
@@ -3746,7 +3760,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 st.markdown("""
     This compares how the different approaches would have grown over time.
 
-    - **Benchmark** = simple buy-and-hold of the selected asset, normalized to start at 1.0
+    - **Benchmark** = simple buy-and-hold of the selected asset, starting from the same initial investment
     - **Primary Strategy** = your first chosen setup
     - **Comparison Strategy** = your second chosen setup
                 """)
