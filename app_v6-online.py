@@ -9,15 +9,22 @@ import intraday_screener
 import time
 import streamlit.components.v1 as components
 import mc_simulator as mc
-import macro_models as mm
 
 from docx.shared import Inches
 from docx import Document
 from datetime import datetime
 from docx.shared import RGBColor
 from ui_themes import apply_theme, style_signal_table, theme_picker
-from backtest_engine import run_walk_forward_backtest
+from backtest_engine import (
+    run_walk_forward_backtest,
+    run_macro_strategy_backtest,
+    build_portfolio_backtest,
+    compute_backtest_analytics,
+    MacroBacktestConfig,
+)
 from strategy_engine import decide_trade
+from macro_fusion import build_macro_state
+import plotly.graph_objects as go
 
 
 
@@ -1360,6 +1367,12 @@ def build_word_report(latest_row: pd.Series,
 
 st.set_page_config(page_title="Gold Macro Cockpit", layout="wide")
 
+
+def simple_explainer(title: str, body: str):
+    with st.expander(title):
+        st.markdown(body)
+
+
 st.title("MRMI - Macro Regime & Market Intelligence platform")
 
 with st.expander("How to interpret this model"):
@@ -1392,6 +1405,11 @@ def load_all(monthly_method: str) -> pd.DataFrame:
 
 with st.sidebar:
     st.header("Settings")
+    simple_explainer("What this section means in simple words", """
+This is where you choose **how the dashboard thinks and what it shows**.
+
+Here you select the model mode, weights, thresholds, chart windows, and optional fast indicators. In simple terms, this section lets you tune the research terminal to match the question you want to ask.
+    """)
     theme = theme_picker(key="theme_picker_global")
 
 apply_theme(theme)
@@ -1557,7 +1575,7 @@ with st.sidebar:
     tickers_top10 = list(dict.fromkeys(tickers_top10))[:MAX_TICKERS]
 
     # Build acceleration features (used by Mode C and/or Combined View)
-    res_accel_base = mm.compute_accel_features(res_base)
+    res_accel_base = compute_accel_features(res_base)
 
     # ----------------------------
     # Build STRUCTURAL weights (always build, so Structural results are consistent even in comparison)
@@ -1609,6 +1627,14 @@ with st.sidebar:
     # 4) Chart controls
     # ----------------------------
     st.subheader("Charts")
+    simple_explainer("What this section means in simple words", """
+These settings control **how much history you see on the screen**.
+
+- **Indicators' Plot Timeframe** changes how many months are shown in the charts.
+- **History view** changes the historical window, for example full history, recent years, or a crisis window.
+
+This section does **not** change the raw data itself. It mainly changes **the window through which you look at the data**.
+    """)
     lookback_options = [6, 12, 24, 36, 60, 120, 180, 240, 360]
     lookback_label_options = [str(x) for x in lookback_options] + ["All available"]
 
@@ -1632,6 +1658,15 @@ with st.sidebar:
     # 5) Trigger controls
     # ----------------------------
     st.subheader("Trigger")
+    simple_explainer("What this section means in simple words", """
+These controls define the **line in the sand** for strong bullish or bearish signals.
+
+- The **bull trigger** says when the score is strong enough to count as clearly positive.
+- The **bear trigger** says when the score is weak enough to count as clearly negative.
+- **Persistence months** asks whether the signal should stay strong for more than one month before you trust it.
+
+Think of this as the platform's **confidence filter**.
+    """)
     trig_hi = st.slider("Bull trigger (+)", 0.0, 1.5, 0.60, 0.05)
     trig_lo = st.slider("Bear trigger (−)", -1.5, 0.0, -0.60, 0.05)
     persist = st.slider("Persistence months", 1, 3, 2, 1)
@@ -1640,6 +1675,14 @@ with st.sidebar:
     # Monte Carlo Settings
     # ----------------------------
     st.subheader("Monte Carlo Settings")
+    simple_explainer("What this section means in simple words", """
+These settings control the **possible future path analysis**.
+
+- **Horizon** tells the model how far into the future to simulate.
+- **Simulations** tells it how many alternative paths to generate.
+
+More simulations usually make the result smoother, but they can take longer.
+    """)
 
     mc_h = st.slider(
         "Monte Carlo horizon (months)",
@@ -1662,6 +1705,11 @@ with st.sidebar:
     # ----------------------------
 
     st.subheader("Live updates")
+    simple_explainer("What this section means in simple words", """
+This section controls whether the dashboard refreshes itself automatically.
+
+Use it when you want the screen to keep updating during the trading day. If you leave it off, the platform only refreshes when you do it manually.
+    """)
 
     live_updates = st.checkbox(
         "Enable live updates (auto-refresh)",
@@ -1691,6 +1739,13 @@ with st.sidebar:
 
     if need_accel_ui:
         st.subheader("Acceleration Settings")
+        simple_explainer("What this section means in simple words", """
+This section controls the **fast-moving part** of the model.
+
+It looks at whether gold is gaining or losing momentum right now by checking things like recent gold performance, changes in real yields, changes in stress, and changes in the dollar.
+
+In simple terms: this is the part that asks whether the market is **speeding up** or **slowing down** for gold.
+        """)
 
         accel_method = st.selectbox(
             "Acceleration thresholds",
@@ -1708,6 +1763,13 @@ with st.sidebar:
         # Intraday RSI controls (Acceleration only)
         # ----------------------------
         st.subheader("Intraday RSI (optional)")
+        simple_explainer("What this section means in simple words", """
+This section adds a **short-term timing view**.
+
+It uses intraday RSI to show whether gold looks stretched upward, stretched downward, or relatively balanced over short timeframes such as minutes or hours.
+
+This is mainly useful for timing and monitoring, not for the slow macro regime itself.
+        """)
 
         show_intraday_rsi = st.checkbox(
             "Show intraday RSI",
@@ -1783,6 +1845,11 @@ with st.sidebar:
     # ----------------------------
     st.markdown("---")
     st.subheader("Threshold Matrix")
+    simple_explainer("What this section means in simple words", """
+This matrix shows the **rules behind the score**.
+
+For each indicator, it shows what the platform treats as bullish, bearish, and in-between. In other words, this is where you can see **why** the model classified a value as supportive or unsupportive.
+    """)
     threshold_box = st.container()
 
     # ----------------------------
@@ -2019,27 +2086,23 @@ def run_accel(res_accel_base: pd.DataFrame, accel_method: str, w_g: float, w_ry:
 # ----------------------------
 if mode == "Structural Regime (today)":
     gold_stats = None
-    res, core_keys, thresholds, dirs, weights_used = mm.run_structural(res_base, weights_struct, dirs_struct)
+    res, core_keys, thresholds, dirs, weights_used = run_structural(res_base, weights_struct, dirs_struct)
     labels_used = labels
 elif mode == "Crisis Similarity (template)":
     # safety: require window
     if not (win_start and win_end):
         st.error("Crisis Similarity mode requires a preset window (or Custom window).")
         st.stop()
-    res, core_keys, thresholds, dirs, weights_used, gold_stats, crisis_ui_meta = mm.run_crisis(res_base, weights_crisis, dirs_crisis, win_start, win_end, conditioned_stats_fn=crisis_conditioned_gold_stats)
-    if crisis_ui_meta.get("error"):
-        st.error(crisis_ui_meta["error"])
-    if crisis_ui_meta.get("warning"):
-        st.warning(crisis_ui_meta["warning"])
+    res, core_keys, thresholds, dirs, weights_used, gold_stats = run_crisis(res_base, weights_crisis, dirs_crisis, win_start, win_end)
     labels_used = labels
 else:
     # Market Acceleration (fast)
     gold_stats = None
-    res, core_keys, thresholds, dirs, weights_used = mm.run_accel(res_accel_base, accel_method, w_g, w_ry, w_st, w_u)
+    res, core_keys, thresholds, dirs, weights_used = run_accel(res_accel_base, accel_method, w_g, w_ry, w_st, w_u)
     labels_used = labels_accel
 
 # Always compute market structural regime once (used in KPI strip + Tab 3 decisions)
-res_market, core_keys_market, thresholds_market, dirs_market_used, weights_market_used = mm.run_market_structural(res_base)
+res_market, core_keys_market, thresholds_market, dirs_market_used, weights_market_used = run_market_structural(res_base)
 latest_market = res_market.iloc[-1] if not res_market.empty else None
 market_regime_now = str(latest_market.get("REGIME", "—")) if latest_market is not None else "—"
 market_signal_now = float(latest_market["SIGNAL"]) if latest_market is not None and "SIGNAL" in latest_market else np.nan
@@ -2150,6 +2213,11 @@ delta = float(latest["SIGNAL"] - prev["SIGNAL"])
 # --- Crisis-conditioned gold response (ONLY in Crisis mode)
 if mode == "Crisis Similarity (template)":
     st.subheader("Crisis-conditioned Gold Response (in-template)")
+    simple_explainer("What this section means in simple words", """
+This section asks a practical question: **When the world looked like this crisis template before, what did gold usually do next?**
+
+It does not predict the future with certainty. It simply looks at similar past moments inside the chosen crisis window and summarizes how gold behaved afterward.
+    """)
     if gold_stats and gold_stats.get("6m", {}).get("ok"):
         g6 = gold_stats["6m"]
         st.write(
@@ -2288,6 +2356,13 @@ def render_history_panel(
     res_market: pd.DataFrame | None = None,
 ):
     st.markdown(f"## {title}")
+    simple_explainer("What this section means in simple words", """
+This section shows the model through time instead of only today.
+
+You can use it to see whether the signal was strengthening, weakening, or changing direction, and whether gold moved in a similar way.
+
+In plain words: this is the section that helps you understand the **story over time**.
+    """)
 
     # ---- history slicing (same behavior as your previous dropdown)
     res_plot = res_panel.copy()
@@ -2733,12 +2808,19 @@ if mode != "Market Acceleration (fast)":
     )
 # --- Combined charts: (Left) RSI daily+monthly, (Right) Gold price
 if mode == "Market Acceleration (fast)":
-    tab1, tab2, tab3 = st.tabs(["Gold Acceleration", "Intraday RSI Screener", "Monte Carlo"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Gold Acceleration", "Intraday RSI Screener", "Monte Carlo", "Walk-Forward Backtest"])
 
     # ----------------------------
     # TAB 1: GOLD ONLY
     # ----------------------------
     with tab1:
+        simple_explainer("What this tab means in simple words", """
+This tab is the **gold-focused dashboard**.
+
+It combines slow macro signals, acceleration, RSI behavior, and gold price charts so you can judge whether gold looks healthy, stretched, weak, or mixed.
+
+Think of it as the main screen for understanding **gold itself**.
+        """)
         left, right = st.columns(2)
 
         # ---------- Build plot window ----------
@@ -2963,6 +3045,11 @@ if mode == "Market Acceleration (fast)":
             st.info("Monte Carlo disabled in Crisis Similarity mode.")
         else:
             st.subheader("Monte Carlo — Analysis")
+            simple_explainer("What this section means in simple words", """
+This section explores **what could happen next**, not just what happened so far.
+
+It creates many possible future price paths based on similar past market states. The goal is to show a reasonable range of outcomes, including a typical path, a weaker path, and a stronger path.
+            """)
 
             with st.expander("### How to interpret these charts"):
                 st.markdown("""
@@ -3174,6 +3261,11 @@ if mode == "Market Acceleration (fast)":
 
                 if mc_summary_rows:
                     st.markdown("### Monte Carlo Summary Table")
+                    simple_explainer("What this table means in simple words", """
+This table puts the main Monte Carlo results for several tickers in one place.
+
+It helps you compare which assets look more favorable, less favorable, or more uncertain under their current tactical setup.
+                    """)
 
                     mc_summary_df = pd.DataFrame(mc_summary_rows)
 
@@ -3186,6 +3278,616 @@ if mode == "Market Acceleration (fast)":
                     best = mc_summary_df.iloc[0]["Ticker"]
                     st.caption(f"Top Monte Carlo probability: **{best}**")
                     st.dataframe(mc_summary_df,use_container_width=True,hide_index=True)
+
+    # ----------------------------
+    # TAB 4: Walk-Forward Backtest
+    # ----------------------------
+    with tab4:
+        st.subheader("Walk-Forward Macro Backtest")
+        simple_explainer("What this section means in simple words", """
+    This section is a **historical replay**. It takes the model back in time and asks:
+    "If I were living at that date, and only knew what was available then, what would the platform have said?"
+
+    So instead of only looking at today, you can see whether the logic was usually helpful, mixed, or weak across many different periods.
+
+    It is still a **research tool**, not a fully realistic trading account simulation.
+    It uses simple assumptions for costs, slippage, confirmation, and holding rules so you can compare ideas more fairly.
+        """)
+
+        # ----------------------------
+        # Core replay settings
+        # ----------------------------
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            min_bt_date = pd.to_datetime(res_base.index.min()).date() if len(res_base.index) else datetime(1975, 1,
+                                                                                                           1).date()
+            max_bt_date = pd.to_datetime(res_base.index.max()).date() if len(
+                res_base.index) else datetime.today().date()
+            default_bt_date = max(min_bt_date, datetime(2005, 1, 1).date())
+            bt_start_dt = st.date_input(
+                "Start date",
+                value=default_bt_date,
+                min_value=min_bt_date,
+                max_value=max_bt_date,
+                key="bt_start_dt",
+            )
+            bt_start = pd.Timestamp(bt_start_dt).date().isoformat()
+
+        with b2:
+            bt_step = int(st.slider("Replay step (months)", 1, 12, 1, 1, key="bt_step"))
+
+        with b3:
+            bt_fwd = int(st.slider("Forward horizon (months)", 1, 12, 12, 1, key="bt_fwd"))
+
+        with b4:
+            bt_price_col = st.selectbox(
+                "Price series",
+                [c for c in ["GOLD_USD", "GLD"] if c in res_base.columns] or ["GOLD_USD"],
+                index=0,
+                key="bt_price_col",
+            )
+
+        simple_explainer("What forward horizon means", """
+    The **x-axis shows decision dates**, not the end date of each trade.
+
+    A **12-month forward horizon** means each replay date is judged by what happened over the **next 12 months**.
+    That forward result is used for evaluation tables.
+
+    The **benchmark curve** is different: it is a simple normalized buy-and-hold path of the selected asset from the first replay date onward.
+        """)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c4:
+            annualize_by = st.selectbox("Analytics basis", ["Monthly", "Custom"], index=0, key="bt_annualize_by")
+            periods_per_year = 12.0 if annualize_by == "Monthly" else max(1.0, 12.0 / max(float(bt_step), 1.0))
+
+        # ----------------------------
+        # Strategy rules
+        # ----------------------------
+        st.markdown("### Strategy Rules")
+        simple_explainer("What these strategy rules mean", """
+    These options let you compare **different decision logics**, not just different trading assumptions.
+
+    - **Current fused strategy** uses the combined macro state.
+    - **Structural-only** listens only to the gold structural regime.
+    - **Acceleration-only** listens only to the acceleration regime.
+    - **RSI-based gold rule** uses gold RSI as a simple timing rule.
+    - **Always-long benchmark** stays invested all the time.
+        """)
+
+        rule_options = [
+            "Current fused strategy",
+            "Structural-only",
+            "Acceleration-only",
+            "RSI-based gold rule",
+            "Always-long benchmark",
+        ]
+
+        sr1, sr2, sr3 = st.columns([1.2, 1.2, 1.0])
+        with sr1:
+            bt_primary_rule = st.selectbox("Primary strategy rule", rule_options, index=0, key="bt_primary_rule")
+        with sr2:
+            bt_compare_rule = st.selectbox("Comparison strategy rule", rule_options, index=1, key="bt_compare_rule")
+        with sr3:
+            compare_enabled = st.checkbox("Enable side-by-side rule comparison", value=True, key="bt_compare_enabled")
+
+        st.markdown("#### Primary execution settings")
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            bt_trading_mode = st.selectbox("Primary trading mode", ["long_flat", "long_short"], index=0,
+                                           key="bt_trading_mode")
+        with p2:
+            bt_tc_bps = float(
+                st.number_input("Primary transaction cost (bps)", min_value=0.0, max_value=500.0, value=10.0, step=1.0,
+                                key="bt_tc_bps"))
+        with p3:
+            bt_slip_bps = float(
+                st.number_input("Primary slippage (bps)", min_value=0.0, max_value=500.0, value=5.0, step=1.0,
+                                key="bt_slip_bps"))
+
+        if compare_enabled:
+            simple_explainer("What the comparison does", """
+    This compares either **different rules**, **different trading assumptions**, or both.
+
+    For example, you can compare:
+    - fused strategy versus structural-only
+    - RSI rule versus always-long
+    - long/flat versus long/short under the same rule
+            """)
+
+            st.markdown("#### Comparison execution settings")
+            cp1, cp2, cp3 = st.columns(3)
+            with cp1:
+                compare_trading_mode = st.selectbox(
+                    "Comparison trading mode",
+                    ["long_flat", "long_short"],
+                    index=1 if bt_trading_mode == "long_flat" else 0,
+                    key="compare_trading_mode",
+                )
+            with cp2:
+                compare_tc_bps = float(st.number_input(
+                    "Comparison transaction cost (bps)",
+                    min_value=0.0,
+                    max_value=500.0,
+                    value=max(bt_tc_bps, 10.0),
+                    step=1.0,
+                    key="compare_tc_bps",
+                ))
+            with cp3:
+                compare_slip_bps = float(st.number_input(
+                    "Comparison slippage (bps)",
+                    min_value=0.0,
+                    max_value=500.0,
+                    value=max(bt_slip_bps, 5.0),
+                    step=1.0,
+                    key="compare_slip_bps",
+                ))
+        else:
+            compare_trading_mode = bt_trading_mode
+            compare_tc_bps = bt_tc_bps
+            compare_slip_bps = bt_slip_bps
+
+        # ----------------------------
+        # Execution realism
+        # ----------------------------
+        st.markdown("### Execution Realism")
+        with st.expander("What these realism settings mean"):
+            st.markdown("""
+    These settings make the replay more realistic.
+
+    - **Execution lag** delays trades instead of acting instantly.
+    - **Confirmation steps** require the same signal to appear repeatedly before acting.
+    - **Minimum hold** prevents the strategy from flipping too quickly.
+    - **Rebalance mode** controls whether size changes are applied often or only when direction truly changes.
+    - **Stop-loss / Take-profit** apply a simple end-of-step risk rule to cap gains or losses for that replay interval.
+            """)
+
+        r1, r2, r3 = st.columns(3)
+        bt_execution_lag = int(
+            r1.number_input("Execution lag (steps)", min_value=0, max_value=6, value=0, step=1, key="bt_execution_lag"))
+        bt_confirmation_steps = int(r2.number_input("Confirmation steps", min_value=1, max_value=6, value=1, step=1,
+                                                    key="bt_confirmation_steps"))
+        bt_min_hold_steps = int(r3.number_input("Minimum hold (steps)", min_value=0, max_value=12, value=0, step=1,
+                                                key="bt_min_hold_steps"))
+
+        r4, r5, r6 = st.columns(3)
+        bt_rebalance_mode = r4.selectbox("Rebalance mode", ["on_change", "every_signal", "threshold"], index=0,
+                                         key="bt_rebalance_mode")
+        bt_rebalance_threshold = float(
+            r5.number_input("Rebalance threshold (%)", min_value=0.0, max_value=50.0, value=2.5, step=0.5,
+                            key="bt_rebalance_threshold"))
+        bt_stop_loss_pct = float(r6.number_input("Stop-loss (%)", min_value=0.0, max_value=50.0, value=0.0, step=0.5,
+                                                 key="bt_stop_loss_pct"))
+
+        r7, _, _ = st.columns(3)
+        bt_take_profit_pct = float(
+            r7.number_input("Take-profit (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5,
+                            key="bt_take_profit_pct"))
+
+
+        # ----------------------------
+        # Rule decision helpers
+        # ----------------------------
+        def _decision_from_rule(rule_name, ms, lg, lm, la, hist_base):
+            rule_name = str(rule_name)
+
+            if rule_name == "Current fused strategy":
+                dec = decide_trade(ticker=bt_price_col, macro_state=ms)
+                pos_size = float(dec.position_size_pct)
+                if pos_size <= 1.0:
+                    pos_size *= 100.0
+                return {
+                    "action": dec.action,
+                    "confidence": dec.confidence,
+                    "position_size_pct": pos_size,
+                    "reason": dec.reason,
+                }
+
+            if rule_name == "Structural-only":
+                sig = pd.to_numeric(pd.Series([lg.get("SIGNAL")]), errors="coerce").iloc[0]
+                reg = str(lg.get("REGIME") or "")
+                if pd.notna(sig) and float(sig) >= 0.60:
+                    return {"action": "BUY", "confidence": 0.75, "position_size_pct": 100.0,
+                            "reason": f"Structural regime bullish ({reg})"}
+                if pd.notna(sig) and float(sig) >= 0.20:
+                    return {"action": "WATCH", "confidence": 0.60, "position_size_pct": 50.0,
+                            "reason": f"Structural regime constructive ({reg})"}
+                if pd.notna(sig) and float(sig) <= -0.60:
+                    return {"action": "SELL", "confidence": 0.75, "position_size_pct": 0.0,
+                            "reason": f"Structural regime defensive ({reg})"}
+                return {"action": "HOLD", "confidence": 0.45, "position_size_pct": 0.0,
+                        "reason": f"Structural regime mixed ({reg})"}
+
+            if rule_name == "Acceleration-only":
+                sig = pd.to_numeric(pd.Series([la.get("SIGNAL")]), errors="coerce").iloc[0]
+                reg = str(la.get("REGIME") or "")
+                if pd.notna(sig) and float(sig) >= 0.60:
+                    return {"action": "BUY", "confidence": 0.72, "position_size_pct": 100.0,
+                            "reason": f"Acceleration bullish ({reg})"}
+                if pd.notna(sig) and float(sig) >= 0.20:
+                    return {"action": "WATCH", "confidence": 0.58, "position_size_pct": 50.0,
+                            "reason": f"Acceleration constructive ({reg})"}
+                if pd.notna(sig) and float(sig) <= -0.60:
+                    return {"action": "SELL", "confidence": 0.72, "position_size_pct": 0.0,
+                            "reason": f"Acceleration headwind ({reg})"}
+                return {"action": "HOLD", "confidence": 0.45, "position_size_pct": 0.0,
+                        "reason": f"Acceleration mixed ({reg})"}
+
+            if rule_name == "RSI-based gold rule":
+                rsi_val = np.nan
+                rsi_slope = np.nan
+
+                for c in ["RSI_14_ASOF", "RSI_14", "RSI_14D"]:
+                    if c in hist_base.columns and hist_base[c].dropna().shape[0]:
+                        rsi_val = float(hist_base[c].dropna().iloc[-1])
+                        break
+
+                if "RSI_SLOPE_3M" in hist_base.columns and hist_base["RSI_SLOPE_3M"].dropna().shape[0]:
+                    rsi_slope = float(hist_base["RSI_SLOPE_3M"].dropna().iloc[-1])
+
+                if pd.notna(rsi_val) and rsi_val <= 40:
+                    return {"action": "BUY", "confidence": 0.55, "position_size_pct": 100.0,
+                            "reason": f"RSI constructive / oversold ({rsi_val:.1f})"}
+                if pd.notna(rsi_val) and rsi_val >= 70:
+                    return {"action": "SELL", "confidence": 0.55, "position_size_pct": 0.0,
+                            "reason": f"RSI stretched / overbought ({rsi_val:.1f})"}
+                if pd.notna(rsi_val) and pd.notna(rsi_slope) and rsi_val < 50 and rsi_slope > 0:
+                    return {"action": "WATCH", "confidence": 0.50, "position_size_pct": 50.0,
+                            "reason": f"RSI improving ({rsi_val:.1f}, slope {rsi_slope:.2f})"}
+                return {"action": "HOLD", "confidence": 0.40, "position_size_pct": 0.0, "reason": "RSI neutral / mixed"}
+
+            if rule_name == "Always-long benchmark":
+                return {"action": "BUY", "confidence": 1.00, "position_size_pct": 100.0,
+                        "reason": "Always invested benchmark"}
+
+            return {"action": "HOLD", "confidence": 0.40, "position_size_pct": 0.0, "reason": "Fallback"}
+
+
+        def _compute_bt_row_factory(rule_name):
+            def _compute_bt_row(hist_df: pd.DataFrame, dt: pd.Timestamp) -> dict:
+                if hist_df.empty or len(hist_df.dropna(how="all")) < 36:
+                    return {"error": "Not enough history"}
+
+                hist_accel = compute_accel_features(hist_df.copy())
+
+                g_res, _, _, _, _ = run_structural(hist_df.copy(), weights_struct, dirs_struct)
+                m_res, _, _, _, _ = run_market_structural(hist_df.copy())
+                a_res, _, _, _, _ = run_accel(hist_accel.copy(), accel_method, w_g, w_ry, w_st, w_u)
+
+                lg = g_res.iloc[-1] if not g_res.empty else pd.Series(dtype=float)
+                lm = m_res.iloc[-1] if not m_res.empty else pd.Series(dtype=float)
+                la = a_res.iloc[-1] if not a_res.empty else pd.Series(dtype=float)
+
+                ms = build_macro_state(
+                    asset=bt_price_col,
+                    as_of_date=str(pd.Timestamp(dt).date()),
+                    gold_signal=lg.get("SIGNAL"),
+                    gold_regime=lg.get("REGIME"),
+                    market_signal=lm.get("SIGNAL"),
+                    market_regime=lm.get("REGIME"),
+                    accel_signal=la.get("SIGNAL"),
+                    accel_regime=la.get("REGIME"),
+                )
+
+                dec = _decision_from_rule(rule_name, ms, lg, lm, la, hist_df)
+
+                return {
+                    "gold_signal": lg.get("SIGNAL"),
+                    "gold_regime": lg.get("REGIME"),
+                    "market_signal": lm.get("SIGNAL"),
+                    "market_regime": lm.get("REGIME"),
+                    "accel_signal": la.get("SIGNAL"),
+                    "accel_regime": la.get("REGIME"),
+                    "macro_score": getattr(ms, "fused_score", np.nan),
+                    "macro_state": getattr(ms, "fused_state", "—"),
+                    "decision": dec["action"],
+                    "decision_confidence": dec["confidence"],
+                    "position_size_pct": dec["position_size_pct"],
+                    "reason": dec["reason"],
+                    "strategy_rule": rule_name,
+                }
+
+            return _compute_bt_row
+
+
+        # ----------------------------
+        # Run primary backtest
+        # ----------------------------
+        bt_cfg = MacroBacktestConfig(
+            ticker=bt_price_col,
+            start_date=bt_start,
+            step=bt_step,
+            price_col=bt_price_col,
+            forward_return_months=bt_fwd,
+            trading_mode=bt_trading_mode,
+            transaction_cost_bps=bt_tc_bps,
+            slippage_bps=bt_slip_bps,
+        )
+
+        bt_df = run_macro_strategy_backtest(
+            res_base,
+            compute_one_date=_compute_bt_row_factory(bt_primary_rule),
+            config=bt_cfg,
+        )
+
+        portfolio_df = build_portfolio_backtest(
+            bt_df,
+            trading_mode=bt_trading_mode,
+            transaction_cost_bps=float(bt_tc_bps),
+            slippage_bps=float(bt_slip_bps),
+            execution_lag_steps=bt_execution_lag,
+            min_hold_steps=bt_min_hold_steps,
+            confirmation_steps=bt_confirmation_steps,
+            rebalance_mode=bt_rebalance_mode,
+            rebalance_threshold_pct=float(bt_rebalance_threshold),
+            stop_loss_pct=float(bt_stop_loss_pct),
+            take_profit_pct=float(bt_take_profit_pct),
+        )
+
+        bt_stats = compute_backtest_analytics(portfolio_df, periods_per_year=float(
+            periods_per_year)) if not portfolio_df.empty else {}
+
+        # ----------------------------
+        # Run comparison backtest
+        # ----------------------------
+        compare_portfolio_df = None
+        compare_stats = {}
+        compare_bt_df = None
+
+        if compare_enabled:
+            compare_cfg = MacroBacktestConfig(
+                ticker=bt_price_col,
+                start_date=bt_start,
+                step=bt_step,
+                price_col=bt_price_col,
+                forward_return_months=bt_fwd,
+                trading_mode=compare_trading_mode,
+                transaction_cost_bps=compare_tc_bps,
+                slippage_bps=compare_slip_bps,
+            )
+
+            compare_bt_df = run_macro_strategy_backtest(
+                res_base,
+                compute_one_date=_compute_bt_row_factory(bt_compare_rule),
+                config=compare_cfg,
+            )
+
+            compare_portfolio_df = build_portfolio_backtest(
+                compare_bt_df,
+                trading_mode=compare_trading_mode,
+                transaction_cost_bps=float(compare_tc_bps),
+                slippage_bps=float(compare_slip_bps),
+                execution_lag_steps=bt_execution_lag,
+                min_hold_steps=bt_min_hold_steps,
+                confirmation_steps=bt_confirmation_steps,
+                rebalance_mode=bt_rebalance_mode,
+                rebalance_threshold_pct=float(bt_rebalance_threshold),
+                stop_loss_pct=float(bt_stop_loss_pct),
+                take_profit_pct=float(bt_take_profit_pct),
+            )
+
+            compare_stats = compute_backtest_analytics(compare_portfolio_df, periods_per_year=float(
+                periods_per_year)) if compare_portfolio_df is not None and not compare_portfolio_df.empty else {}
+
+        # ----------------------------
+        # Headline metrics
+        # ----------------------------
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Replay rows", int(bt_stats.get("rows", 0)) if bt_stats else 0)
+        m2.metric("BUY hit rate", f"{bt_stats.get('buy_hit_rate_pct', np.nan):.1f}%" if bt_stats and pd.notna(
+            bt_stats.get("buy_hit_rate_pct", np.nan)) else "—")
+        m3.metric("Strategy total return", f"{bt_stats.get('total_return_pct', np.nan):.1f}%" if bt_stats and pd.notna(
+            bt_stats.get("total_return_pct", np.nan)) else "—")
+        m4.metric("Max drawdown", f"{bt_stats.get('max_drawdown_pct', np.nan):.1f}%" if bt_stats and pd.notna(
+            bt_stats.get("max_drawdown_pct", np.nan)) else "—")
+
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("Confirmed rows", int(bt_stats.get("confirmed_rows", 0)) if bt_stats else 0)
+        n2.metric("Stop events", int(bt_stats.get("stop_events", 0)) if bt_stats else 0)
+        n3.metric("Take-profit events", int(bt_stats.get("take_profit_events", 0)) if bt_stats else 0)
+        n4.metric("Avg turnover", f"{bt_stats.get('avg_turnover_pct', np.nan):.2f}%" if bt_stats and pd.notna(
+            bt_stats.get("avg_turnover_pct", np.nan)) else "—")
+
+        # ----------------------------
+        # Comparison summary
+        # ----------------------------
+        if compare_enabled:
+            st.markdown("### Side-by-Side Strategy Comparison")
+            with st.expander("What this section means"):
+                st.markdown("""
+    This compares the two selected setups on the same historical period.
+
+    You can compare:
+    - different **rules**
+    - different **trading modes**
+    - different **cost/slippage assumptions**
+                """)
+
+            comp_rows = [
+                {
+                    "Setup": f"Primary — {bt_primary_rule}",
+                    "Trading Mode": bt_trading_mode,
+                    "TC (bps)": bt_tc_bps,
+                    "Slip (bps)": bt_slip_bps,
+                    "Total Return (%)": bt_stats.get("total_return_pct", np.nan),
+                    "CAGR (%)": bt_stats.get("cagr_pct", np.nan),
+                    "Volatility (%)": bt_stats.get("volatility_pct", np.nan),
+                    "Sharpe-like": bt_stats.get("sharpe_like", np.nan),
+                    "Max DD (%)": bt_stats.get("max_drawdown_pct", np.nan),
+                },
+                {
+                    "Setup": f"Comparison — {bt_compare_rule}",
+                    "Trading Mode": compare_trading_mode,
+                    "TC (bps)": compare_tc_bps,
+                    "Slip (bps)": compare_slip_bps,
+                    "Total Return (%)": compare_stats.get("total_return_pct", np.nan),
+                    "CAGR (%)": compare_stats.get("cagr_pct", np.nan),
+                    "Volatility (%)": compare_stats.get("volatility_pct", np.nan),
+                    "Sharpe-like": compare_stats.get("sharpe_like", np.nan),
+                    "Max DD (%)": compare_stats.get("max_drawdown_pct", np.nan),
+                },
+            ]
+            st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+
+        # ----------------------------
+        # Charts
+        # ----------------------------
+        if not portfolio_df.empty:
+            curve_df = portfolio_df[["as_of_date", "equity_curve", "benchmark_curve"]].dropna().copy()
+            curve_df = curve_df.rename(columns={"equity_curve": "Primary Strategy", "benchmark_curve": "Benchmark"})
+            if compare_enabled and compare_portfolio_df is not None and not compare_portfolio_df.empty:
+                comp_curve = compare_portfolio_df[["as_of_date", "equity_curve"]].dropna().copy()
+                comp_curve = comp_curve.rename(columns={"equity_curve": "Comparison Strategy"})
+                curve_df = curve_df.merge(comp_curve, on="as_of_date", how="outer")
+            curve_df = curve_df.set_index("as_of_date").sort_index()
+
+            st.markdown("### Strategy vs Benchmark")
+            with st.expander("What this chart means"):
+                st.markdown("""
+    This compares how the different approaches would have grown over time.
+
+    - **Benchmark** = simple buy-and-hold of the selected asset, normalized to start at 1.0
+    - **Primary Strategy** = your first chosen setup
+    - **Comparison Strategy** = your second chosen setup
+                """)
+            fig_curve = go.Figure()
+            if "Benchmark" in curve_df.columns:
+                fig_curve.add_trace(
+                    go.Scatter(x=curve_df.index, y=curve_df["Benchmark"], mode="lines", name="Benchmark"))
+            if "Comparison Strategy" in curve_df.columns:
+                fig_curve.add_trace(go.Scatter(x=curve_df.index, y=curve_df["Comparison Strategy"], mode="lines",
+                                               name="Comparison Strategy", line=dict(dash="dot")))
+            if "Primary Strategy" in curve_df.columns:
+                fig_curve.add_trace(
+                    go.Scatter(x=curve_df.index, y=curve_df["Primary Strategy"], mode="lines", name="Primary Strategy",
+                               line=dict(dash="dash")))
+            fig_curve.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=20), legend=dict(orientation="h"))
+            st.plotly_chart(fig_curve, use_container_width=True)
+
+            dd_df = portfolio_df[["as_of_date", "drawdown_pct"]].dropna().copy().rename(
+                columns={"drawdown_pct": "Primary Strategy"})
+            if compare_enabled and compare_portfolio_df is not None and not compare_portfolio_df.empty:
+                comp_dd = compare_portfolio_df[["as_of_date", "drawdown_pct"]].dropna().copy().rename(
+                    columns={"drawdown_pct": "Comparison Strategy"})
+                dd_df = dd_df.merge(comp_dd, on="as_of_date", how="outer")
+            dd_df = dd_df.set_index("as_of_date").sort_index()
+
+            st.markdown("### Strategy Drawdown (%)")
+            with st.expander("What this chart means"):
+                st.markdown("Smaller drops usually mean an easier ride emotionally and financially.")
+            fig_dd = go.Figure()
+            if "Comparison Strategy" in dd_df.columns:
+                fig_dd.add_trace(
+                    go.Scatter(x=dd_df.index, y=dd_df["Comparison Strategy"], mode="lines", name="Comparison Strategy",
+                               line=dict(dash="dot")))
+            if "Primary Strategy" in dd_df.columns:
+                fig_dd.add_trace(
+                    go.Scatter(x=dd_df.index, y=dd_df["Primary Strategy"], mode="lines", name="Primary Strategy",
+                               line=dict(dash="dash")))
+            fig_dd.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=20), legend=dict(orientation="h"))
+            st.plotly_chart(fig_dd, use_container_width=True)
+
+            rets_df = portfolio_df[["as_of_date", "strategy_period_return_pct", "asset_period_return_pct"]].dropna(
+                how="all").copy()
+            rets_df = rets_df.rename(
+                columns={"strategy_period_return_pct": "Primary Strategy", "asset_period_return_pct": "Asset"})
+            if compare_enabled and compare_portfolio_df is not None and not compare_portfolio_df.empty:
+                comp_rets = compare_portfolio_df[["as_of_date", "strategy_period_return_pct"]].dropna().copy()
+                comp_rets = comp_rets.rename(columns={"strategy_period_return_pct": "Comparison Strategy"})
+                rets_df = rets_df.merge(comp_rets, on="as_of_date", how="outer")
+            rets_df = rets_df.set_index("as_of_date").sort_index()
+
+            st.markdown("### Period Returns: Strategy vs Asset (%)")
+            with st.expander("What this chart means"):
+                st.markdown("""
+    This shows the return earned during each replay step.
+
+    - **Primary Strategy** = first setup
+    - **Comparison Strategy** = second setup
+    - **Asset** = the raw market move
+                """)
+            fig_rets = go.Figure()
+            if "Asset" in rets_df.columns:
+                fig_rets.add_trace(go.Scatter(x=rets_df.index, y=rets_df["Asset"], mode="lines", name="Asset"))
+            if "Comparison Strategy" in rets_df.columns:
+                fig_rets.add_trace(go.Scatter(x=rets_df.index, y=rets_df["Comparison Strategy"], mode="lines",
+                                              name="Comparison Strategy", line=dict(dash="dot")))
+            if "Primary Strategy" in rets_df.columns:
+                fig_rets.add_trace(
+                    go.Scatter(x=rets_df.index, y=rets_df["Primary Strategy"], mode="lines", name="Primary Strategy",
+                               line=dict(dash="dash")))
+            fig_rets.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=20), legend=dict(orientation="h"))
+            st.plotly_chart(fig_rets, use_container_width=True)
+
+        # ----------------------------
+        # Tables
+        # ----------------------------
+        if not portfolio_df.empty:
+            st.markdown("### Action Performance Summary")
+            with st.expander("What this table means"):
+                st.markdown("""
+    This table groups historical results by the action the rule suggested.
+
+    It helps you check whether BUY, WATCH, HOLD, and SELL were actually useful on average.
+                """)
+
+            fwd_cols = [c for c in portfolio_df.columns if c.startswith("fwd_") and c.endswith("m_ret_pct")]
+            fwd_col = fwd_cols[0] if fwd_cols else None
+            summary_rows = []
+            if fwd_col is not None:
+                tmp = portfolio_df.copy()
+                tmp["decision"] = tmp["decision"].astype(str)
+                for act, grp in tmp.groupby("decision", dropna=False):
+                    vals = pd.to_numeric(grp[fwd_col], errors="coerce").dropna()
+                    summary_rows.append({
+                        "Action": act,
+                        "Rows": int(len(grp)),
+                        "Avg forward return (%)": float(vals.mean()) if not vals.empty else np.nan,
+                        "Median forward return (%)": float(vals.median()) if not vals.empty else np.nan,
+                        "Hit rate (%)": float((vals > 0).mean() * 100.0) if not vals.empty else np.nan,
+                    })
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("### Replay Table")
+            with st.expander("Signals vs executed positions — plain-English guide"):
+                st.markdown("""
+    There are **two layers** here:
+
+    - **Signal Action** = what the rule suggested
+    - **Executed Trade / Position** = what the portfolio actually did after applying lag, confirmation, holding, and risk rules
+
+    So a BUY signal does not always mean the trade was executed immediately.
+                """)
+
+            show_cols = [
+                "as_of_date",
+                "strategy_rule",
+                "gold_regime",
+                "market_regime",
+                "accel_regime",
+                "macro_state",
+                "macro_score",
+                "decision",
+                "decision_confidence",
+                "signal_action",
+                "executed_trade",
+                "position_before_label",
+                "position_before_pct",
+                "position_after_label",
+                "position_after_pct",
+                "hold_steps_in_position",
+                "stop_triggered",
+                "take_profit_triggered",
+                "asset_period_return_pct",
+                "strategy_period_return_pct",
+                "equity_curve",
+                "benchmark_curve",
+                "drawdown_pct",
+                "reason",
+            ]
+            show_cols = [c for c in show_cols if c in portfolio_df.columns]
+            replay_show = portfolio_df[show_cols].copy()
+            st.dataframe(replay_show, use_container_width=True, hide_index=True)
 
     # ---- Gold-only panels must render ONLY in Tab1
     with tab1:
@@ -3248,24 +3950,18 @@ if st.button("Generate Word report (.docx)"):
 
         def compute_mode_pack(m: str):
             if m == "Structural Regime (today)":
-                return mm.run_structural(res_base, weights_struct, dirs_struct), labels
+                return run_structural(res_base, weights_struct, dirs_struct), labels
 
             if m == "Crisis Similarity (template)":
                 if not (win_start and win_end):
                     st.error("Comparison report includes Crisis Similarity but no window selected.")
                     st.stop()
-                pack7 = mm.run_crisis(res_base, weights_crisis, dirs_crisis, win_start, win_end, conditioned_stats_fn=crisis_conditioned_gold_stats)
-                ui_meta = pack7[6]
-                if ui_meta.get("error"):
-                    st.error(ui_meta["error"])
-                if ui_meta.get("warning"):
-                    st.warning(ui_meta["warning"])
-                pack6 = pack7[:6]
+                pack6 = run_crisis(res_base, weights_crisis, dirs_crisis, win_start, win_end)
                 pack5 = pack6[:5]  # drop gold_stats for compare report
                 return pack5, labels
 
             # Market Acceleration
-            return mm.run_accel(res_accel_base, accel_method, w_g, w_ry, w_st, w_u), labels_accel
+            return run_accel(res_accel_base, accel_method, w_g, w_ry, w_st, w_u), labels_accel
 
         packL, labelsL = compute_mode_pack(left_mode)
         packR, labelsR = compute_mode_pack(right_mode)
