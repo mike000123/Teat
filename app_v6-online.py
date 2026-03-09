@@ -1422,7 +1422,7 @@ with st.sidebar:
     mode = st.selectbox(
         "Model mode",
         ["Structural Regime (today)", "Crisis Similarity (template)", "Market Acceleration (fast)"],
-        index=0
+        index=2
     )
 
     # ----------------------------
@@ -3303,7 +3303,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
                                                                                                            1).date()
             max_bt_date = pd.to_datetime(res_base.index.max()).date() if len(
                 res_base.index) else datetime.today().date()
-            default_bt_date = max(min_bt_date, datetime(2005, 1, 1).date())
+            default_bt_date = max(min_bt_date, datetime(2020, 1, 1).date())
             bt_start_dt = st.date_input(
                 "Start date",
                 value=default_bt_date,
@@ -3379,14 +3379,14 @@ It helps you compare which assets look more favorable, less favorable, or more u
         with sr1:
             bt_primary_rule = st.selectbox("Primary strategy rule", rule_options, index=0, key="bt_primary_rule")
         with sr2:
-            bt_compare_rule = st.selectbox("Comparison strategy rule", rule_options, index=1, key="bt_compare_rule")
+            bt_compare_rule = st.selectbox("Comparison strategy rule", rule_options, index=3, key="bt_compare_rule")
         with sr3:
             compare_enabled = st.checkbox("Enable side-by-side rule comparison", value=True, key="bt_compare_enabled")
 
         st.markdown("#### Primary execution settings")
         p1, p2, p3 = st.columns(3)
         with p1:
-            bt_trading_mode = st.selectbox("Primary trading mode", ["long_flat", "long_short"], index=0,
+            bt_trading_mode = st.selectbox("Primary trading mode", ["long_short", "long_flat"], index=0,
                                            key="bt_trading_mode")
         with p2:
             bt_tc_bps = float(
@@ -3413,7 +3413,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 compare_trading_mode = st.selectbox(
                     "Comparison trading mode",
                     ["long_flat", "long_short"],
-                    index=1 if bt_trading_mode == "long_flat" else 0,
+                    index=0 if bt_trading_mode == "long_flat" else 1,
                     key="compare_trading_mode",
                 )
             with cp2:
@@ -3468,12 +3468,12 @@ It helps you compare which assets look more favorable, less favorable, or more u
         bt_rebalance_threshold = float(
             r5.number_input("Rebalance threshold (%)", min_value=0.0, max_value=50.0, value=2.5, step=0.5,
                             key="bt_rebalance_threshold"))
-        bt_stop_loss_pct = float(r6.number_input("Stop-loss (%)", min_value=0.0, max_value=50.0, value=0.0, step=0.5,
+        bt_stop_loss_pct = float(r6.number_input("Stop-loss (%)", min_value=0.0, max_value=50.0, value=5.0, step=0.5,
                                                  key="bt_stop_loss_pct"))
 
         r7, _, _ = st.columns(3)
         bt_take_profit_pct = float(
-            r7.number_input("Take-profit (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5,
+            r7.number_input("Take-profit (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5,
                             key="bt_take_profit_pct"))
 
 
@@ -3747,35 +3747,195 @@ It helps you compare which assets look more favorable, less favorable, or more u
         # Charts
         # ----------------------------
         if not portfolio_df.empty:
-            curve_df = portfolio_df[["as_of_date", "equity_curve", "benchmark_curve"]].dropna().copy()
-            curve_df = curve_df.rename(columns={"equity_curve": "Primary Strategy", "benchmark_curve": "Benchmark"})
+            curve_df = portfolio_df[["as_of_date", "equity_curve", "benchmark_curve", "price"]].dropna(how="all").copy()
+            curve_df = curve_df.rename(columns={
+                "equity_curve": "Primary Strategy",
+                "benchmark_curve": "Benchmark Portfolio",
+                "price": "Benchmark Raw Price",
+            })
+
             if compare_enabled and compare_portfolio_df is not None and not compare_portfolio_df.empty:
                 comp_curve = compare_portfolio_df[["as_of_date", "equity_curve"]].dropna().copy()
                 comp_curve = comp_curve.rename(columns={"equity_curve": "Comparison Strategy"})
                 curve_df = curve_df.merge(comp_curve, on="as_of_date", how="outer")
+
             curve_df = curve_df.set_index("as_of_date").sort_index()
 
             st.markdown("### Strategy vs Benchmark")
             with st.expander("What this chart means"):
                 st.markdown("""
-    This compares how the different approaches would have grown over time.
+            This chart uses **3 axes**:
 
-    - **Benchmark** = simple buy-and-hold of the selected asset, starting from the same initial investment
-    - **Primary Strategy** = your first chosen setup
-    - **Comparison Strategy** = your second chosen setup
+            - **Left axis** = strategy portfolio value
+            - **Second left axis** = raw benchmark price
+            - **Right axis** = cumulative % change since the start
+
+            So you can read:
+            - the actual money value of the strategies
+            - the raw benchmark asset price
+            - the percentage growth of each series
+
+            The benchmark price is shown in its own raw market units, while the strategy values are shown in portfolio money terms.
                 """)
+
             fig_curve = go.Figure()
-            if "Benchmark" in curve_df.columns:
-                fig_curve.add_trace(
-                    go.Scatter(x=curve_df.index, y=curve_df["Benchmark"], mode="lines", name="Benchmark"))
-            if "Comparison Strategy" in curve_df.columns:
-                fig_curve.add_trace(go.Scatter(x=curve_df.index, y=curve_df["Comparison Strategy"], mode="lines",
-                                               name="Comparison Strategy", line=dict(dash="dot")))
+
+
+            def _pct_from_start(s):
+                s = pd.to_numeric(s, errors="coerce")
+                first_valid = s.dropna()
+                if first_valid.empty:
+                    return s * np.nan
+                start_val = float(first_valid.iloc[0])
+                if start_val == 0:
+                    return s * np.nan
+                return (s / start_val - 1.0) * 100.0
+
+
+            # ---------------------------
+            # LEFT AXIS 1: strategy values
+            # ---------------------------
             if "Primary Strategy" in curve_df.columns:
                 fig_curve.add_trace(
-                    go.Scatter(x=curve_df.index, y=curve_df["Primary Strategy"], mode="lines", name="Primary Strategy",
-                               line=dict(dash="dash")))
-            fig_curve.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=20), legend=dict(orientation="h"))
+                    go.Scatter(
+                        x=curve_df.index,
+                        y=curve_df["Primary Strategy"],
+                        mode="lines",
+                        name="Primary value",
+                        yaxis="y",
+                        line=dict(color="#1f77b4", width=2.5),
+                        hovertemplate="%{x}<br>Primary value: %{y:,.2f}<extra></extra>",
+                    )
+                )
+
+            if "Comparison Strategy" in curve_df.columns:
+                fig_curve.add_trace(
+                    go.Scatter(
+                        x=curve_df.index,
+                        y=curve_df["Comparison Strategy"],
+                        mode="lines",
+                        name="Comparison value",
+                        yaxis="y",
+                        line=dict(color="#66b3ff", width=2.5),
+                        hovertemplate="%{x}<br>Comparison value: %{y:,.2f}<extra></extra>",
+                    )
+                )
+
+            # ---------------------------
+            # LEFT AXIS 2: raw benchmark price
+            # ---------------------------
+            if "Benchmark Raw Price" in curve_df.columns:
+                fig_curve.add_trace(
+                    go.Scatter(
+                        x=curve_df.index,
+                        y=curve_df["Benchmark Raw Price"],
+                        mode="lines",
+                        name="Benchmark raw price",
+                        yaxis="y3",
+                        line=dict(color="#d62728", width=2.5),
+                        hovertemplate="%{x}<br>Benchmark raw price: %{y:,.2f}<extra></extra>",
+                    )
+                )
+
+            # ---------------------------
+            # RIGHT AXIS: % change
+            # ---------------------------
+            if "Primary Strategy" in curve_df.columns:
+                prim_pct = _pct_from_start(curve_df["Primary Strategy"])
+                fig_curve.add_trace(
+                    go.Scatter(
+                        x=curve_df.index,
+                        y=prim_pct,
+                        mode="lines",
+                        name="Primary %",
+                        yaxis="y2",
+                        line=dict(color="#1f77b4", width=2, dash="dash"),
+                        hovertemplate="%{x}<br>Primary change: %{y:.2f}%<extra></extra>",
+                    )
+                )
+
+            if "Comparison Strategy" in curve_df.columns:
+                comp_pct = _pct_from_start(curve_df["Comparison Strategy"])
+                fig_curve.add_trace(
+                    go.Scatter(
+                        x=curve_df.index,
+                        y=comp_pct,
+                        mode="lines",
+                        name="Comparison %",
+                        yaxis="y2",
+                        line=dict(color="#66b3ff", width=2, dash="dash"),
+                        hovertemplate="%{x}<br>Comparison change: %{y:.2f}%<extra></extra>",
+                    )
+                )
+
+            if "Benchmark Raw Price" in curve_df.columns:
+                bench_pct = _pct_from_start(curve_df["Benchmark Raw Price"])
+                fig_curve.add_trace(
+                    go.Scatter(
+                        x=curve_df.index,
+                        y=bench_pct,
+                        mode="lines",
+                        name="Benchmark %",
+                        yaxis="y2",
+                        line=dict(color="#d62728", width=2, dash="dash"),
+                        hovertemplate="%{x}<br>Benchmark change: %{y:.2f}%<extra></extra>",
+                    )
+                )
+
+            fig_curve.update_layout(
+                height=540,
+                margin=dict(l=20, r=20, t=10, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.28, xanchor="left", x=0),
+                hovermode="x unified",
+
+                yaxis=dict(
+                    title=dict(
+                        text="Strategy portfolio value",
+                        font=dict(color="#1f77b4"),
+                    ),
+                    tickfont=dict(color="#1f77b4"),
+                    side="left",
+                    showgrid=True,
+                    zeroline=False,
+                    showline=True,
+                    linecolor="#1f77b4",
+                    tickcolor="#1f77b4",
+                ),
+
+                yaxis2=dict(
+                    title=dict(
+                        text="% change since start",
+                        font=dict(color="#666666"),
+                    ),
+                    tickfont=dict(color="#666666"),
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                    zeroline=False,
+                    ticksuffix="%",
+                    showline=True,
+                    linecolor="#666666",
+                    tickcolor="#666666",
+                ),
+
+                yaxis3=dict(
+                    title=dict(
+                        text="Benchmark raw price",
+                        font=dict(color="#d62728"),
+                    ),
+                    tickfont=dict(color="#d62728"),
+                    anchor="free",
+                    overlaying="y",
+                    side="left",
+                    position=0.08,
+                    showgrid=False,
+                    zeroline=False,
+                    showline=True,
+                    linecolor="#d62728",
+                    tickcolor="#d62728",
+                ),
+            )
+
             st.plotly_chart(fig_curve, use_container_width=True)
 
             dd_df = portfolio_df[["as_of_date", "drawdown_pct"]].dropna().copy().rename(
@@ -3832,6 +3992,90 @@ It helps you compare which assets look more favorable, less favorable, or more u
                                line=dict(dash="dash")))
             fig_rets.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=20), legend=dict(orientation="h"))
             st.plotly_chart(fig_rets, use_container_width=True)
+
+        # ----------------------------
+        # Quick winner summary
+        # ----------------------------
+        st.markdown("### Quick Summary")
+        with st.expander("What this summary means"):
+            st.markdown("""
+        This box highlights which setup looked best on three simple criteria:
+
+        - **Highest total return** = made the most money overall
+        - **Lowest max drawdown** = suffered the smallest worst drop
+        - **Best return/drawdown tradeoff** = balanced gain versus pain most efficiently
+
+        This helps you see quickly whether a strategy mainly wins on growth, safety, or balance.
+            """)
+
+        summary_candidates = [
+            {
+                "name": f"Primary — {bt_primary_rule}",
+                "total_return_pct": bt_stats.get("total_return_pct", np.nan),
+                "max_drawdown_pct": bt_stats.get("max_drawdown_pct", np.nan),
+            }
+        ]
+
+        if compare_enabled and compare_stats:
+            summary_candidates.append(
+                {
+                    "name": f"Comparison — {bt_compare_rule}",
+                    "total_return_pct": compare_stats.get("total_return_pct", np.nan),
+                    "max_drawdown_pct": compare_stats.get("max_drawdown_pct", np.nan),
+                }
+            )
+
+        # Return / drawdown tradeoff:
+        # use total_return / abs(max_drawdown), but only when drawdown is valid and non-zero
+        for item in summary_candidates:
+            tr = pd.to_numeric(pd.Series([item["total_return_pct"]]), errors="coerce").iloc[0]
+            dd = pd.to_numeric(pd.Series([item["max_drawdown_pct"]]), errors="coerce").iloc[0]
+            if pd.notna(tr) and pd.notna(dd) and abs(dd) > 1e-9:
+                item["tradeoff_score"] = float(tr) / abs(float(dd))
+            else:
+                item["tradeoff_score"] = np.nan
+
+
+        def _best_valid(items, key, higher_is_better=True):
+            vals = []
+            for x in items:
+                v = pd.to_numeric(pd.Series([x.get(key)]), errors="coerce").iloc[0]
+                if pd.notna(v):
+                    vals.append((x["name"], float(v)))
+            if not vals:
+                return ("—", np.nan)
+            return max(vals, key=lambda z: z[1]) if higher_is_better else min(vals, key=lambda z: z[1])
+
+
+        best_return_name, best_return_val = _best_valid(summary_candidates, "total_return_pct", higher_is_better=True)
+        best_drawdown_name, best_drawdown_val = _best_valid(summary_candidates, "max_drawdown_pct",
+                                                            higher_is_better=True)
+        best_tradeoff_name, best_tradeoff_val = _best_valid(summary_candidates, "tradeoff_score", higher_is_better=True)
+
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            st.info(
+                f"**Highest total return**\n\n"
+                f"{best_return_name}\n\n"
+                f"{best_return_val:.1f}%" if pd.notna(best_return_val) else
+                "**Highest total return**\n\n—"
+            )
+
+        with s2:
+            st.info(
+                f"**Lowest max drawdown**\n\n"
+                f"{best_drawdown_name}\n\n"
+                f"{best_drawdown_val:.1f}%" if pd.notna(best_drawdown_val) else
+                "**Lowest max drawdown**\n\n—"
+            )
+
+        with s3:
+            st.info(
+                f"**Best return / drawdown tradeoff**\n\n"
+                f"{best_tradeoff_name}\n\n"
+                f"{best_tradeoff_val:.2f}" if pd.notna(best_tradeoff_val) else
+                "**Best return / drawdown tradeoff**\n\n—"
+            )
 
         # ----------------------------
         # Tables

@@ -427,7 +427,13 @@ def compute_backtest_analytics(portfolio_df: pd.DataFrame, periods_per_year: flo
     dd = pd.to_numeric(df.get("drawdown_pct"), errors="coerce")
     turnover = pd.to_numeric(df.get("turnover_pct"), errors="coerce")
 
-    total_return_pct = float(eq.dropna().iloc[-1] - 100.0) if eq.dropna().shape[0] else np.nan
+    eq_valid = eq.dropna()
+    if eq_valid.shape[0]:
+        start_equity = float(eq_valid.iloc[0])
+        end_equity = float(eq_valid.iloc[-1])
+        total_return_pct = ((end_equity / start_equity) - 1.0) * 100.0 if start_equity != 0 else np.nan
+    else:
+        total_return_pct = np.nan
     max_drawdown_pct = float(dd.min()) if dd.dropna().shape[0] else np.nan
     avg_turnover_pct = float(turnover.mean()) if turnover.dropna().shape[0] else np.nan
 
@@ -441,7 +447,14 @@ def compute_backtest_analytics(portfolio_df: pd.DataFrame, periods_per_year: flo
         mean_r = float(strat.mean())
         vol_r = float(strat.std(ddof=0))
         years = max(rows / float(periods_per_year), 1e-9)
-        cagr_pct = ((eq.dropna().iloc[-1] / 100.0) ** (1.0 / years) - 1.0) * 100.0 if eq.dropna().shape[0] else np.nan
+
+        if eq_valid.shape[0]:
+            start_equity = float(eq_valid.iloc[0])
+            end_equity = float(eq_valid.iloc[-1])
+            cagr_pct = ((end_equity / start_equity) ** (1.0 / years) - 1.0) * 100.0 if start_equity > 0 else np.nan
+        else:
+            cagr_pct = np.nan
+
         volatility_pct = vol_r * np.sqrt(periods_per_year) * 100.0
         sharpe_like = (mean_r / vol_r) * np.sqrt(periods_per_year) if vol_r > 0 else np.nan
     else:
