@@ -265,7 +265,8 @@ def build_portfolio_backtest(
     )
 
     raw_actions = df.get("decision", pd.Series(index=df.index, dtype=object)).astype(str).str.upper()
-    raw_sizes = pd.to_numeric(df.get("position_size_pct", 100.0), errors="coerce").fillna(100.0)
+    raw_sizes = df["position_size_pct"] if "position_size_pct" in df.columns else pd.Series(100.0, index=df.index)
+    raw_sizes = pd.to_numeric(raw_sizes, errors="coerce").fillna(100.0)
 
     # confirmation logic
     conf_n = max(1, int(confirmation_steps))

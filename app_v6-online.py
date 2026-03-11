@@ -26,7 +26,12 @@ from strategy_engine import decide_trade
 from macro_fusion import build_macro_state
 import plotly.graph_objects as go
 
-
+from walkforward_mc_validation import (
+    MCValidationConfig,
+    run_walkforward_mc_validation,
+    summarize_mc_validation,
+    build_tactical_state_series,
+)
 
 # -----------------------------
 # FRED CSV download helpers
@@ -3282,6 +3287,44 @@ It helps you compare which assets look more favorable, less favorable, or more u
     # ----------------------------
     # TAB 4: Walk-Forward Backtest
     # ----------------------------
+
+    def _prepare_bt_for_portfolio(bt_in: pd.DataFrame, trading_mode: str) -> pd.DataFrame:
+        bt = bt_in.copy()
+
+        if "signal_action" not in bt.columns and "decision" in bt.columns:
+            bt["signal_action"] = bt["decision"]
+        if "signal_confidence" not in bt.columns and "decision_confidence" in bt.columns:
+            bt["signal_confidence"] = bt["decision_confidence"]
+
+        bt["signal_action"] = (
+            bt["signal_action"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+        # Preserve replay-generated sizing whenever present
+        if "position_size_pct" not in bt.columns:
+            bt["position_size_pct"] = np.nan
+
+        bt["position_size_pct"] = pd.to_numeric(bt["position_size_pct"], errors="coerce")
+
+        mode = str(trading_mode).lower().strip()
+        sell_mask = bt["signal_action"] == "SELL"
+
+        if mode == "long_short":
+            # Only fill missing SELL size; do not overwrite existing replay sizing
+            bt.loc[sell_mask & bt["position_size_pct"].isna(), "position_size_pct"] = 100.0
+        else:
+            bt.loc[sell_mask & bt["position_size_pct"].isna(), "position_size_pct"] = 0.0
+
+        # Conservative defaults only when size is missing
+        bt.loc[(bt["signal_action"] == "HOLD") & bt["position_size_pct"].isna(), "position_size_pct"] = 0.0
+        bt.loc[(bt["signal_action"] == "WATCH") & bt["position_size_pct"].isna(), "position_size_pct"] = 0.0
+        bt.loc[(bt["signal_action"] == "BUY") & bt["position_size_pct"].isna(), "position_size_pct"] = 100.0
+
+        return bt
+
     with tab4:
         st.subheader("Walk-Forward Macro Backtest")
         simple_explainer("What this section means in simple words", """
@@ -3476,6 +3519,57 @@ It helps you compare which assets look more favorable, less favorable, or more u
             r7.number_input("Take-profit (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5,
                             key="bt_take_profit_pct"))
 
+        # ----------------------------
+        # Historical Monte Carlo Validation
+        # ----------------------------
+        st.markdown("### Historical Monte Carlo Validation")
+        simple_explainer("What this section means in simple words", """
+        This section checks whether the Monte Carlo forecast method would have been useful in the past.
+
+        For each replay date, the platform:
+        - runs a Monte Carlo forecast using only information available then
+        - records p10 / p50 / p90
+        - compares that forecast with what actually happened later
+
+        So this is not today's forecast. It is a historical test of how well the forecast cone worked.
+        """)
+
+        mv1, mv2, mv3, mv4 = st.columns(4)
+        with mv1:
+            wf_mc_enabled = st.checkbox("Enable MC validation", value=True, key="wf_mc_enabled")
+        with mv2:
+            wf_mc_hist_bars = int(
+                st.number_input(
+                    "MC history bars",
+                    min_value=120,
+                    max_value=2000,
+                    value=500,
+                    step=20,
+                    key="wf_mc_hist_bars",
+                )
+            )
+        with mv3:
+            wf_mc_block = int(
+                st.number_input(
+                    "MC block size",
+                    min_value=2,
+                    max_value=20,
+                    value=5,
+                    step=1,
+                    key="wf_mc_block",
+                )
+            )
+        with mv4:
+            wf_mc_sims = int(
+                st.number_input(
+                    "MC simulations",
+                    min_value=200,
+                    max_value=5000,
+                    value=1000,
+                    step=100,
+                    key="wf_mc_sims",
+                )
+            )
 
         # ----------------------------
         # Rule decision helpers
@@ -3484,6 +3578,14 @@ It helps you compare which assets look more favorable, less favorable, or more u
             rule_name = str(rule_name)
 
             if rule_name == "Current fused strategy":
+                if ms is None:
+                    return {
+                        "action": "HOLD",
+                        "confidence": 0.20,
+                        "position_size_pct": 0.0,
+                        "reason": "Macro state unavailable in replay row",
+                    }
+
                 dec = decide_trade(ticker=bt_price_col, macro_state=ms)
                 pos_size = float(dec.position_size_pct)
                 if pos_size <= 1.0:
@@ -3570,18 +3672,34 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 lm = m_res.iloc[-1] if not m_res.empty else pd.Series(dtype=float)
                 la = a_res.iloc[-1] if not a_res.empty else pd.Series(dtype=float)
 
-                ms = build_macro_state(
-                    asset=bt_price_col,
-                    as_of_date=str(pd.Timestamp(dt).date()),
-                    gold_signal=lg.get("SIGNAL"),
-                    gold_regime=lg.get("REGIME"),
-                    market_signal=lm.get("SIGNAL"),
-                    market_regime=lm.get("REGIME"),
-                    accel_signal=la.get("SIGNAL"),
-                    accel_regime=la.get("REGIME"),
-                )
+                macro_state_label = "—"
+                macro_score_val = np.nan
+                ms = None
+                macro_error = None
+
+                # Only fused strategy really needs macro_state, but we still try to build it safely
+                try:
+                    ms = build_macro_state(
+                        asset=bt_price_col,
+                        as_of_date=str(pd.Timestamp(dt).date()),
+                        gold_signal=lg.get("SIGNAL"),
+                        gold_regime=lg.get("REGIME"),
+                        market_signal=lm.get("SIGNAL"),
+                        market_regime=lm.get("REGIME"),
+                        accel_signal=la.get("SIGNAL"),
+                        accel_regime=la.get("REGIME"),
+                    )
+                    macro_state_label = getattr(ms, "fused_state", "—")
+                    macro_score_val = getattr(ms, "fused_score", np.nan)
+                except Exception as e:
+                    macro_error = str(e)
+                    ms = None
 
                 dec = _decision_from_rule(rule_name, ms, lg, lm, la, hist_df)
+
+                reason_text = dec["reason"]
+                if macro_error is not None:
+                    reason_text = f"{reason_text} | macro_state_error: {macro_error}"
 
                 return {
                     "gold_signal": lg.get("SIGNAL"),
@@ -3590,12 +3708,12 @@ It helps you compare which assets look more favorable, less favorable, or more u
                     "market_regime": lm.get("REGIME"),
                     "accel_signal": la.get("SIGNAL"),
                     "accel_regime": la.get("REGIME"),
-                    "macro_score": getattr(ms, "fused_score", np.nan),
-                    "macro_state": getattr(ms, "fused_state", "—"),
+                    "macro_score": macro_score_val,
+                    "macro_state": macro_state_label,
                     "decision": dec["action"],
                     "decision_confidence": dec["confidence"],
                     "position_size_pct": dec["position_size_pct"],
-                    "reason": dec["reason"],
+                    "reason": reason_text,
                     "strategy_rule": rule_name,
                 }
 
@@ -3622,8 +3740,203 @@ It helps you compare which assets look more favorable, less favorable, or more u
             config=bt_cfg,
         )
 
+        with st.expander("Primary run window", expanded=True):
+            if not bt_df.empty and "as_of_date" in bt_df.columns:
+                d = pd.to_datetime(bt_df["as_of_date"], errors="coerce")
+                st.write({
+                    "rows": int(len(bt_df)),
+                    "min_date": str(d.min()),
+                    "max_date": str(d.max()),
+                })
+
+        with st.expander("Replay Decision Debug", expanded=False):
+
+            st.write("Primary bt_df columns:")
+            st.write(list(bt_df.columns))
+
+            if "decision" in bt_df.columns:
+                st.write("Primary decision counts:")
+                st.write(bt_df["decision"].astype(str).value_counts(dropna=False))
+                st.write("Primary decision null count:", int(bt_df["decision"].isna().sum()))
+            else:
+                st.error("Primary bt_df is missing the 'decision' column.")
+
+            debug_cols = [c for c in [
+                "as_of_date",
+                "strategy_rule",
+                "gold_signal",
+                "gold_regime",
+                "market_signal",
+                "market_regime",
+                "accel_signal",
+                "accel_regime",
+                "macro_state",
+                "macro_score",
+                "decision",
+                "decision_confidence",
+                "position_size_pct",
+                "signal_action",
+                "signal_confidence",
+                "reason",
+                "error",
+            ] if c in bt_df.columns]
+
+            if debug_cols:
+                st.write("Primary replay sample:")
+                st.dataframe(bt_df[debug_cols].head(25), width="stretch", hide_index=True)
+
+            primary_macro_debug_cols = [c for c in [
+                "as_of_date",
+                "gold_signal",
+                "gold_regime",
+                "market_signal",
+                "market_regime",
+                "accel_signal",
+                "accel_regime",
+                "macro_score",
+                "macro_state",
+                "decision",
+                "reason",
+            ] if c in bt_df.columns]
+
+            st.write("Primary macro input sample:")
+            st.dataframe(
+                bt_df[primary_macro_debug_cols].head(25),
+                width="stretch",
+                hide_index=True,
+            )
+
+            if "error" in bt_df.columns and bt_df["error"].notna().any():
+                st.warning("Replay row errors detected in primary strategy")
+                st.dataframe(
+                    bt_df.loc[bt_df["error"].notna(), ["as_of_date", "error"]].head(20),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        with st.expander("Primary decision counts", expanded=True):
+            if "decision" in bt_df.columns:
+                st.write(bt_df["decision"].astype(str).value_counts(dropna=False))
+
+        with st.expander("Primary BUY rows", expanded=False):
+            if "decision" in bt_df.columns:
+                buy_rows = bt_df[bt_df["decision"].astype(str).str.upper() == "BUY"].copy()
+
+                cols = [c for c in [
+                    "as_of_date",
+                    "gold_signal",
+                    "market_signal",
+                    "accel_signal",
+                    "macro_score",
+                    "macro_state",
+                    "decision",
+                    "decision_confidence",
+                    "reason"
+                ] if c in buy_rows.columns]
+
+                st.dataframe(buy_rows[cols], use_container_width=True, hide_index=True)
+
+        with st.expander("Primary WATCH rows", expanded=False):
+            if "decision" in bt_df.columns:
+                watch_rows = bt_df[bt_df["decision"].astype(str).str.upper() == "WATCH"].copy()
+
+                cols = [c for c in [
+                    "as_of_date",
+                    "gold_signal",
+                    "market_signal",
+                    "accel_signal",
+                    "macro_score",
+                    "macro_state",
+                    "decision",
+                    "decision_confidence",
+                    "reason"
+                ] if c in watch_rows.columns]
+
+                st.dataframe(watch_rows[cols], use_container_width=True, hide_index=True)
+
+        bt_df["signal_action"] = bt_df["decision"] if "decision" in bt_df.columns else np.nan
+        bt_df["signal_confidence"] = bt_df["decision_confidence"] if "decision_confidence" in bt_df.columns else np.nan
+
+        # ----------------------------
+        # Replay dataframe debug
+        # ----------------------------
+        debug_cols = [c for c in ["as_of_date", "decision", "position_size_pct", "reason", "error"] if
+                      c in bt_df.columns]
+
+
+        mc_validation_df = pd.DataFrame()
+        mc_validation_summary = {}
+
+        if wf_mc_enabled:
+            mc_cfg = MCValidationConfig(
+                horizon_steps=int(bt_fwd),
+                n_sims=int(wf_mc_sims),
+                block_size=int(wf_mc_block),
+                seed=7,
+            )
+
+            mc_validation_df = run_walkforward_mc_validation(
+                replay_df=bt_df,
+                full_price=res_base[bt_price_col],
+                benchmark_price=res_base["QQQ"] if "QQQ" in res_base.columns else None,
+                horizon_months=int(bt_fwd),
+                cfg=mc_cfg,
+            )
+
+            if mc_validation_df is not None and not mc_validation_df.empty:
+                bt_df = mc_validation_df
+                mc_validation_summary = summarize_mc_validation(mc_validation_df)
+
+        with st.expander("Primary pre-portfolio debug", expanded=False):
+            st.write("Primary bt_df columns before _prepare_bt_for_portfolio:")
+            st.write(list(bt_df.columns))
+
+        bt_df_for_port = _prepare_bt_for_portfolio(bt_df, bt_trading_mode)
+
+        with st.expander("DEBUG SUMMARY BEFORE PORTFOLIO (new)", expanded=True):
+            dbg = bt_df_for_port.copy()
+
+            st.write("columns:", list(dbg.columns))
+
+            if "decision" in dbg.columns:
+                st.write("decision counts")
+                st.write(dbg["decision"].astype(str).value_counts(dropna=False))
+
+            if "signal_action" in dbg.columns:
+                st.write("signal_action counts")
+                st.write(dbg["signal_action"].astype(str).value_counts(dropna=False))
+
+            if "position_size_pct" in dbg.columns:
+                st.write("position_size_pct counts")
+                st.write(dbg["position_size_pct"].value_counts(dropna=False).sort_index())
+
+            cols = [c for c in
+                    ["as_of_date", "decision", "signal_action", "signal_confidence", "position_size_pct", "reason"] if
+                    c in dbg.columns]
+            st.write("head")
+            st.dataframe(dbg[cols].head(15), use_container_width=True, hide_index=True)
+
+        with st.expander("Primary bt_df_for_port debug", expanded=True):
+            cols = [c for c in [
+                "as_of_date",
+                "decision",
+                "signal_action",
+                "position_size_pct",
+                "signal_confidence",
+                "reason",
+            ] if c in bt_df_for_port.columns]
+            st.dataframe(bt_df_for_port[cols].head(25), use_container_width=True, hide_index=True)
+
+            if "signal_action" in bt_df_for_port.columns:
+                st.write("signal_action counts")
+                st.write(bt_df_for_port["signal_action"].astype(str).value_counts(dropna=False))
+
+            if "position_size_pct" in bt_df_for_port.columns:
+                st.write("position_size_pct counts")
+                st.write(bt_df_for_port["position_size_pct"].value_counts(dropna=False).sort_index())
+
         portfolio_df = build_portfolio_backtest(
-            bt_df,
+            bt_df_for_port,
             initial_capital=float(bt_initial_capital),
             trading_mode=bt_trading_mode,
             transaction_cost_bps=float(bt_tc_bps),
@@ -3636,6 +3949,64 @@ It helps you compare which assets look more favorable, less favorable, or more u
             stop_loss_pct=float(bt_stop_loss_pct),
             take_profit_pct=float(bt_take_profit_pct),
         )
+
+        with st.expander("DEBUG SUMMARY AFTER PORTFOLIO", expanded=True):
+            dbg = portfolio_df.copy()
+
+            st.write("columns:", list(dbg.columns))
+
+            for col in ["raw_action", "confirmed_action", "executed_trade", "position_after_label"]:
+                if col in dbg.columns:
+                    st.write(f"{col} counts")
+                    st.write(dbg[col].astype(str).value_counts(dropna=False))
+
+            for col in ["position_after_pct", "applied_position_pct", "turnover_pct"]:
+                if col in dbg.columns:
+                    st.write(f"{col} counts")
+                    st.write(dbg[col].value_counts(dropna=False).sort_index())
+
+            cols = [c for c in [
+                "as_of_date",
+                "decision",
+                "signal_action",
+                "raw_action",
+                "confirmed_action",
+                "executed_trade",
+                "position_before_pct",
+                "position_after_pct",
+                "applied_position_pct",
+                "turnover_pct",
+                "strategy_period_return_pct",
+                "stop_triggered",
+                "take_profit_triggered",
+            ] if c in dbg.columns]
+
+            st.write("head")
+            st.dataframe(dbg[cols].head(20), use_container_width=True, hide_index=True)
+
+        with st.expander("Primary portfolio_df debug", expanded=True):
+            cols = [c for c in [
+                "as_of_date",
+                "decision",
+                "signal_action",
+                "position_size_pct",
+                "raw_action",
+                "confirmed_action",
+                "signal_confirmed",
+                "executed_trade",
+                "position_before_label",
+                "position_before_pct",
+                "position_after_label",
+                "position_after_pct",
+                "applied_position_pct",
+                "next_position_pct",
+                "turnover_pct",
+                "strategy_period_return_pct",
+                "stop_triggered",
+                "take_profit_triggered",
+                "equity_curve",
+            ] if c in portfolio_df.columns]
+            st.dataframe(portfolio_df[cols].head(30), use_container_width=True, hide_index=True)
 
         bt_stats = compute_backtest_analytics(portfolio_df, periods_per_year=float(
             periods_per_year)) if not portfolio_df.empty else {}
@@ -3665,8 +4036,93 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 config=compare_cfg,
             )
 
+            # Force overwrite mapping so stale/empty columns cannot survive
+            compare_bt_df["signal_action"] = compare_bt_df[
+                "decision"] if "decision" in compare_bt_df.columns else np.nan
+            compare_bt_df["signal_confidence"] = compare_bt_df[
+                "decision_confidence"] if "decision_confidence" in compare_bt_df.columns else np.nan
+
+            with st.expander("Comparison Replay Debug", expanded=False):
+                st.write("Comparison bt_df columns:")
+                st.write(list(compare_bt_df.columns))
+
+                if "decision" in compare_bt_df.columns:
+                    st.write("Comparison decision counts:")
+                    st.write(compare_bt_df["decision"].astype(str).value_counts(dropna=False))
+                    st.write("Comparison decision null count:", int(compare_bt_df["decision"].isna().sum()))
+                else:
+                    st.error("Comparison bt_df is missing the 'decision' column.")
+
+                cmp_debug_cols = [c for c in [
+                    "as_of_date",
+                    "strategy_rule",
+                    "gold_signal",
+                    "gold_regime",
+                    "market_signal",
+                    "market_regime",
+                    "accel_signal",
+                    "accel_regime",
+                    "macro_state",
+                    "macro_score",
+                    "decision",
+                    "decision_confidence",
+                    "position_size_pct",
+                    "signal_action",
+                    "signal_confidence",
+                    "reason",
+                    "error",
+                ] if c in compare_bt_df.columns]
+
+                if cmp_debug_cols:
+                    st.write("Comparison replay sample:")
+                    st.dataframe(compare_bt_df[cmp_debug_cols].head(25), width="stretch", hide_index=True)
+
+                cmp_macro_debug_cols = [c for c in [
+                    "as_of_date",
+                    "gold_signal",
+                    "gold_regime",
+                    "market_signal",
+                    "market_regime",
+                    "accel_signal",
+                    "accel_regime",
+                    "macro_score",
+                    "macro_state",
+                    "decision",
+                    "reason",
+                ] if c in compare_bt_df.columns]
+
+                if cmp_macro_debug_cols:
+                    st.write("Comparison macro input sample:")
+                    st.dataframe(compare_bt_df[cmp_macro_debug_cols].head(25), width="stretch", hide_index=True)
+
+                if "error" in compare_bt_df.columns and compare_bt_df["error"].notna().any():
+                    st.warning("Replay row errors detected in comparison strategy")
+                    st.dataframe(
+                        compare_bt_df.loc[compare_bt_df["error"].notna(), ["as_of_date", "error"]].head(20),
+                        width="stretch",
+                        hide_index=True,
+                    )
+
+            with st.expander("Comparison pre-portfolio debug", expanded=False):
+                st.write("Comparison bt_df columns before _prepare_bt_for_portfolio:")
+                st.write(list(compare_bt_df.columns))
+
+            #---------- Comparison backtest start
+
+            compare_bt_df_for_port = _prepare_bt_for_portfolio(compare_bt_df, compare_trading_mode)
+
+            with st.expander("Comparison bt_df_for_port debug", expanded=True):
+                dbg_cols = [c for c in [
+                    "as_of_date",
+                    "decision",
+                    "signal_action",
+                    "position_size_pct",
+                    "signal_confidence",
+                ] if c in compare_bt_df_for_port.columns]
+                st.dataframe(compare_bt_df_for_port[dbg_cols].head(40), use_container_width=True)
+
             compare_portfolio_df = build_portfolio_backtest(
-                compare_bt_df,
+                compare_bt_df_for_port,
                 initial_capital=float(bt_initial_capital),
                 trading_mode=compare_trading_mode,
                 transaction_cost_bps=float(compare_tc_bps),
@@ -3680,8 +4136,52 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 take_profit_pct=float(bt_take_profit_pct),
             )
 
-            compare_stats = compute_backtest_analytics(compare_portfolio_df, periods_per_year=float(
-                periods_per_year)) if compare_portfolio_df is not None and not compare_portfolio_df.empty else {}
+            with st.expander("Comparison Portfolio Debug", expanded=True):
+                dbg_cols = [c for c in [
+                    "as_of_date",
+                    "decision",
+                    "signal_action",
+                    "position_size_pct",
+                    "raw_action",
+                    "confirmed_action",
+                    "signal_confirmed",
+                    "executed_trade",
+                    "position_before_pct",
+                    "position_after_pct",
+                    "applied_position_pct",
+                    "next_position_pct",
+                    "strategy_period_return_pct",
+                    "equity_curve",
+                ] if c in compare_portfolio_df.columns]
+
+                st.dataframe(compare_portfolio_df[dbg_cols].head(40), use_container_width=True)
+
+            # ---- DEBUG BLOCK (add here) ----
+            with st.expander("Comparison Portfolio Debug", expanded=False):
+                st.write("Comparison portfolio_df columns:")
+                st.write(list(compare_portfolio_df.columns))
+
+                dbg_cols = [c for c in [
+                    "as_of_date",
+                    "decision",
+                    "signal_action",
+                    "position_size_pct",
+                    "executed_trade",
+                    "position_before_pct",
+                    "position_after_pct",
+                    "position_before_label",
+                    "position_after_label",
+                    "strategy_period_return_pct",
+                    "equity_curve",
+                ] if c in compare_portfolio_df.columns]
+
+                if dbg_cols:
+                    st.dataframe(compare_portfolio_df[dbg_cols].head(25), width="stretch", hide_index=True)
+
+            compare_stats = compute_backtest_analytics(
+                compare_portfolio_df,
+                periods_per_year=float(periods_per_year)
+            ) if compare_portfolio_df is not None and not compare_portfolio_df.empty else {}
 
         # ----------------------------
         # Headline metrics
@@ -4078,6 +4578,282 @@ It helps you compare which assets look more favorable, less favorable, or more u
             )
 
         # ----------------------------
+        # Historical Monte Carlo Validation results
+        # ----------------------------
+        if wf_mc_enabled and mc_validation_summary:
+            st.markdown("### Historical Monte Carlo Validation Results")
+            with st.expander("What these metrics mean"):
+                st.markdown("""
+        These metrics tell you how well the Monte Carlo cone worked historically.
+
+        - **Inside p10–p90** = how often the real later outcome stayed inside the forecast band
+        - **Below p10** = how often reality was worse than the model's lower band
+        - **Above p90** = how often reality was stronger than the model's upper band
+        - **Directional hit** = how often the sign of the actual return matched the forecast median
+        - **Median abs error vs p50** = typical distance between reality and the model's middle forecast
+                """)
+
+            vm1, vm2, vm3, vm4, vm5 = st.columns(5)
+            vm1.metric("Inside p10–p90", f"{mc_validation_summary.get('inside_p10_p90_pct', np.nan):.1f}%")
+            vm2.metric("Below p10", f"{mc_validation_summary.get('below_p10_pct', np.nan):.1f}%")
+            vm3.metric("Above p90", f"{mc_validation_summary.get('above_p90_pct', np.nan):.1f}%")
+            vm4.metric("Directional hit", f"{mc_validation_summary.get('direction_hit_pct', np.nan):.1f}%")
+            vm5.metric("Median abs error vs p50", f"{mc_validation_summary.get('median_abs_err_pct', np.nan):.2f}%")
+
+        if wf_mc_enabled and not bt_df.empty and {"mc_p10_ret_pct", "mc_p50_ret_pct", "mc_p90_ret_pct",
+                                                  "mc_actual_ret_pct"}.issubset(bt_df.columns):
+
+            col_mc_left, col_mc_right = st.columns(2)
+
+            # -------------------------------------------------
+            # LEFT: Existing historical validation chart
+            # -------------------------------------------------
+            with col_mc_left:
+                val_plot = bt_df[
+                    ["as_of_date", "mc_p10_ret_pct", "mc_p50_ret_pct", "mc_p90_ret_pct", "mc_actual_ret_pct"]
+                ].dropna(how="all").copy()
+
+                if not val_plot.empty:
+                    val_plot["as_of_date"] = pd.to_datetime(val_plot["as_of_date"], errors="coerce")
+                    val_plot = val_plot.sort_values("as_of_date")
+
+                    st.markdown("### Forecast Cone vs Actual Outcome")
+                    with st.expander("What this chart means"):
+                        st.markdown("""
+        For each replay date:
+        - dashed lower line = Monte Carlo p10
+        - middle dashed line = Monte Carlo p50
+        - dashed upper line = Monte Carlo p90
+        - solid line = what actually happened later
+
+        If the solid line often stays between p10 and p90, the forecast cone is reasonably calibrated.
+                        """)
+
+                    fig_val = go.Figure()
+
+                    fig_val.add_trace(go.Scatter(
+                        x=val_plot["as_of_date"],
+                        y=val_plot["mc_p10_ret_pct"],
+                        mode="lines",
+                        name="MC p10",
+                        line=dict(color="#d62728", dash="dash"),
+                    ))
+                    fig_val.add_trace(go.Scatter(
+                        x=val_plot["as_of_date"],
+                        y=val_plot["mc_p50_ret_pct"],
+                        mode="lines",
+                        name="MC p50",
+                        line=dict(color="#1f77b4", dash="dash"),
+                    ))
+                    fig_val.add_trace(go.Scatter(
+                        x=val_plot["as_of_date"],
+                        y=val_plot["mc_p90_ret_pct"],
+                        mode="lines",
+                        name="MC p90",
+                        line=dict(color="#2ca02c", dash="dash"),
+                    ))
+                    fig_val.add_trace(go.Scatter(
+                        x=val_plot["as_of_date"],
+                        y=val_plot["mc_actual_ret_pct"],
+                        mode="lines",
+                        name="Actual forward return",
+                        line=dict(color="#000000", width=2),
+                    ))
+
+                    fig_val.update_layout(
+                        height=420,
+                        margin=dict(l=20, r=20, t=10, b=20),
+                        legend=dict(orientation="h"),
+                        yaxis=dict(title=f"Forward return over {bt_fwd} bars (%)"),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_val, use_container_width=True)
+
+            # -------------------------------------------------
+            # RIGHT: Historical cone replay from Start date
+            # -------------------------------------------------
+            with col_mc_right:
+                st.markdown("### Historical Cone Replay from Start Date")
+                with st.expander("What this chart means"):
+                    st.markdown("""
+        This chart anchors the Monte Carlo cone at the Walk-Forward **Start date**.
+
+        It shows:
+        - recent actual price history leading into that date
+        - the simulated Monte Carlo cone from that date forward
+        - the actual realized price path over the next forecast horizon
+
+        This lets you judge visually how accurate the cone was for that specific historical start date.
+                    """)
+
+                price_full = pd.to_numeric(res_base[bt_price_col], errors="coerce").dropna().astype(float).sort_index()
+                anchor_ts = pd.Timestamp(bt_start)
+
+                hist_px = price_full.loc[price_full.index <= anchor_ts].copy()
+
+                if hist_px.empty:
+                    st.info("No price history available up to the selected Start date.")
+                else:
+                    anchor_used = hist_px.index[-1]
+                    start_price = float(hist_px.iloc[-1])
+
+                    # recent history for visual context
+                    hist_context = price_full.loc[price_full.index <= anchor_used].tail(12).copy()
+
+                    # realized future path over the next bt_fwd bars
+                    actual_future = price_full.loc[price_full.index > anchor_used].head(int(bt_fwd)).copy()
+
+                    # benchmark history for tactical-state construction
+                    bench_hist = None
+                    if "QQQ" in res_base.columns:
+                        bench_full = pd.to_numeric(res_base["QQQ"], errors="coerce").dropna().astype(float).sort_index()
+                        bench_hist = bench_full.loc[bench_full.index <= anchor_used].copy()
+
+                    cone_cfg = MCValidationConfig(
+                        horizon_steps=int(bt_fwd),
+                        n_sims=int(wf_mc_sims),
+                        block_size=int(wf_mc_block),
+                        seed=7,
+                    )
+
+                    state_hist, meta = build_tactical_state_series(
+                        price=hist_px,
+                        benchmark_price=bench_hist,
+                        cfg=cone_cfg,
+                    )
+
+                    cone_df, state_used = mc.monte_carlo_cone_by_tactical_state_block(
+                        price=hist_px,
+                        state=state_hist,
+                        state_now=meta.get("state_now"),
+                        horizon_steps=int(bt_fwd),
+                        n_sims=int(wf_mc_sims),
+                        block_size=int(wf_mc_block),
+                        seed=7,
+                    )
+
+                    if cone_df.empty:
+                        st.info(f"Not enough history in tactical state ({state_used}) to build the cone.")
+                    else:
+                        # Use actual future dates when available; otherwise fallback to monthly future dates
+                        if len(actual_future) >= len(cone_df):
+                            future_dates = actual_future.index[:len(cone_df)]
+                        else:
+                            future_dates = pd.date_range(
+                                start=anchor_used,
+                                periods=len(cone_df) + 1,
+                                freq="M"
+                            )[1:]
+
+                        cone_plot = cone_df.copy()
+                        cone_plot["future_date"] = future_dates
+
+                        # prepend anchor point so p10/p50/p90 all start from same price
+                        anchor_row = pd.DataFrame({
+                            "future_date": [anchor_used],
+                            "p10": [start_price],
+                            "p50": [start_price],
+                            "p90": [start_price],
+                        })
+                        cone_plot = pd.concat(
+                            [anchor_row, cone_plot[["future_date", "p10", "p50", "p90"]]],
+                            ignore_index=True
+                        )
+
+                        # actual realized path also starts from the anchor
+                        actual_plot = pd.concat([
+                            pd.Series([start_price], index=[anchor_used]),
+                            actual_future
+                        ]).sort_index()
+
+                        fig_cone = go.Figure()
+
+                        # recent history before anchor
+                        fig_cone.add_trace(go.Scatter(
+                            x=hist_context.index,
+                            y=hist_context.values,
+                            mode="lines",
+                            name="Actual price (pre-anchor)",
+                            line=dict(color="#7f7f7f"),
+                        ))
+
+                        # upper band first
+                        fig_cone.add_trace(go.Scatter(
+                            x=cone_plot["future_date"],
+                            y=cone_plot["p90"],
+                            mode="lines",
+                            name="MC p90",
+                            line=dict(color="#2ca02c", dash="dash"),
+                        ))
+
+                        # lower band, filled to previous trace
+                        fig_cone.add_trace(go.Scatter(
+                            x=cone_plot["future_date"],
+                            y=cone_plot["p10"],
+                            mode="lines",
+                            name="MC p10",
+                            line=dict(color="#d62728", dash="dash"),
+                            fill="tonexty",
+                            fillcolor="rgba(31,119,180,0.10)",
+                        ))
+
+                        # median path
+                        fig_cone.add_trace(go.Scatter(
+                            x=cone_plot["future_date"],
+                            y=cone_plot["p50"],
+                            mode="lines",
+                            name="MC p50",
+                            line=dict(color="#1f77b4", dash="dash"),
+                        ))
+
+                        # actual realized path
+                        fig_cone.add_trace(go.Scatter(
+                            x=actual_plot.index,
+                            y=actual_plot.values,
+                            mode="lines+markers",
+                            name="Actual realized path",
+                            line=dict(color="#000000", width=2),
+                        ))
+
+                        fig_cone.update_layout(
+                            height=420,
+                            margin=dict(l=20, r=20, t=10, b=20),
+                            legend=dict(orientation="h"),
+                            yaxis=dict(title="Price"),
+                            hovermode="x unified",
+                        )
+
+                        st.caption(f"Anchor used: {anchor_used.date()} | MC tactical state: {state_used}")
+                        st.plotly_chart(fig_cone, use_container_width=True)
+
+        if wf_mc_enabled and not bt_df.empty:
+            mc_cols = [
+                "as_of_date",
+                "mc_state",
+                "mc_p10_ret_pct",
+                "mc_p50_ret_pct",
+                "mc_p90_ret_pct",
+                "mc_prob_up_pct",
+                "mc_actual_ret_pct",
+                "mc_inside_p10_p90",
+                "mc_below_p10",
+                "mc_above_p90",
+                "mc_direction_hit",
+                "mc_abs_err_p50",
+            ]
+            mc_cols = [c for c in mc_cols if c in bt_df.columns]
+
+            if mc_cols:
+                st.markdown("### Historical MC Validation Table")
+                with st.expander("What this table means"):
+                    st.markdown("""
+        This table shows the Monte Carlo forecast and the actual later result for each replay date.
+
+        It helps you inspect where the forecast worked well, where it missed, and whether errors happened in specific market states.
+                    """)
+                st.dataframe(bt_df[mc_cols], use_container_width=True, hide_index=True)
+
+        # ----------------------------
         # Tables
         # ----------------------------
         if not portfolio_df.empty:
@@ -4146,6 +4922,28 @@ It helps you compare which assets look more favorable, less favorable, or more u
             show_cols = [c for c in show_cols if c in portfolio_df.columns]
             replay_show = portfolio_df[show_cols].copy()
             st.dataframe(replay_show, use_container_width=True, hide_index=True)
+
+            if compare_enabled and compare_bt_df is not None and not compare_bt_df.empty:
+                cmp_macro_debug_cols = [c for c in [
+                    "as_of_date",
+                    "gold_signal",
+                    "gold_regime",
+                    "market_signal",
+                    "market_regime",
+                    "accel_signal",
+                    "accel_regime",
+                    "macro_score",
+                    "macro_state",
+                    "decision",
+                    "reason",
+                ] if c in compare_bt_df.columns]
+
+                st.write("Comparison macro input sample:")
+                st.dataframe(
+                    compare_bt_df[cmp_macro_debug_cols].head(25),
+                    width="stretch",
+                    hide_index=True,
+                )
 
     # ---- Gold-only panels must render ONLY in Tab1
     with tab1:

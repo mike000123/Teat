@@ -185,3 +185,58 @@ def monte_carlo_paths_by_regime(
 def mc_percentiles(paths: np.ndarray, ps=(10, 50, 90)) -> pd.DataFrame:
     p = {f"p{q}": np.percentile(paths, q, axis=0) for q in ps}
     return pd.DataFrame(p)
+
+def monte_carlo_cone_by_tactical_state_block(
+    price: pd.Series,
+    state: pd.Series,
+    state_now: str | None = None,
+    horizon_steps: int = 12,
+    n_sims: int = 1000,
+    block_size: int = 5,
+    seed: int = 7,
+):
+    """
+    Returns step-by-step p10 / p50 / p90 price cone from a chosen anchor history.
+
+    Parameters
+    ----------
+    price : pd.Series
+        Historical price series up to the anchor date only.
+    state : pd.Series
+        Tactical state series aligned to price.
+    state_now : str | None
+        Current tactical state at the anchor date. If None, latest state is used.
+    horizon_steps : int
+        Number of future bars to simulate.
+    n_sims : int
+        Number of Monte Carlo paths.
+    block_size : int
+        Block size for block bootstrap.
+    seed : int
+        RNG seed.
+
+    Returns
+    -------
+    cone_df : pd.DataFrame
+        Columns: step, p10, p50, p90
+    state_used : str
+        Tactical state used for conditioning.
+    """
+    paths, state_used = monte_carlo_paths_by_tactical_state_block(
+        price=price,
+        state=state,
+        state_now=state_now,
+        horizon_steps=horizon_steps,
+        n_sims=n_sims,
+        block_size=block_size,
+        seed=seed,
+    )
+
+    if paths is None:
+        return pd.DataFrame(columns=["step", "p10", "p50", "p90"]), state_used
+
+    bands = mc_percentiles(paths).copy()
+    bands["step"] = np.arange(1, len(bands) + 1)
+
+    cols = ["step", "p10", "p50", "p90"]
+    return bands[cols], state_used
