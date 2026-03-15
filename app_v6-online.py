@@ -1,4 +1,3 @@
-import io
 import requests
 import numpy as np
 import pandas as pd
@@ -6,7 +5,6 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import tempfile
 import intraday_screener
-import time
 import streamlit.components.v1 as components
 import mc_simulator as mc
 
@@ -25,6 +23,13 @@ from backtest_engine import (
 from strategy_engine import decide_trade
 from macro_fusion import build_macro_state
 import plotly.graph_objects as go
+import time
+import io
+
+import re
+from pathlib import Path
+
+_FRED_SESSION = requests.Session()
 
 from walkforward_mc_validation import (
     MCValidationConfig,
@@ -36,6 +41,139 @@ from walkforward_mc_validation import (
 # -----------------------------
 # FRED CSV download helpers
 # -----------------------------
+
+CACHE_ROOT = Path("data_cache")
+FRED_CACHE_DIR = CACHE_ROOT / "fred"
+YF_DAILY_CACHE_DIR = CACHE_ROOT / "yahoo_daily"
+
+for _p in [CACHE_ROOT, FRED_CACHE_DIR, YF_DAILY_CACHE_DIR]:
+    _p.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_path_series(cache_dir: Path, key: str) -> Path:
+    safe_key = (
+        str(key)
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+        .replace("=", "_")
+        .replace("?", "_")
+        .replace("*", "_")
+        .replace(" ", "_")
+    )
+    return cache_dir / f"{safe_key}.parquet"
+
+
+def load_series_cache(cache_dir: Path, key: str) -> pd.Series | None:
+    path = _cache_path_series(cache_dir, key)
+    if not path.exists():
+        return None
+
+    try:
+        df = pd.read_parquet(path)
+        if df.empty:
+            return None
+
+        # expected columns: date, value
+        if "date" not in df.columns or "value" not in df.columns:
+            return None
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["date"])
+
+        s = df.set_index("date")["value"].sort_index()
+        s.name = key
+        return s
+    except Exception:
+        return None
+
+
+def save_series_cache(cache_dir: Path, key: str, s: pd.Series) -> None:
+    if s is None or len(s) == 0:
+        return
+
+    try:
+        ser = s.copy()
+        ser.index = pd.to_datetime(ser.index, errors="coerce")
+        ser = pd.to_numeric(ser, errors="coerce")
+        ser = ser[~ser.index.isna()]
+        if len(ser) == 0:
+            return
+
+        df = pd.DataFrame({
+            "date": ser.index,
+            "value": ser.values,
+        })
+        df.to_parquet(_cache_path_series(cache_dir, key), index=False)
+    except Exception:
+        pass
+
+def load_yf_panel_fast(tickers, start="2000-01-01"):
+    out = {}
+    failed = {}
+
+    for t in tickers:
+        s, src, err = load_yf_series_fast(t, start=start)
+        if s is not None and not s.empty:
+            out[t] = s
+        else:
+            failed[t] = err
+
+    panel = pd.DataFrame(out).sort_index() if out else pd.DataFrame()
+    return panel, failed
+
+def load_yf_series_fast(ticker: str, start="1970-01-01"):
+    """
+    Cache-first Yahoo daily loader for a single ticker.
+    Returns a daily Series.
+    """
+    cached = load_series_cache(YF_DAILY_CACHE_DIR, ticker)
+
+    if cached is not None and not cached.empty and not refresh_remote_data:
+        cached.name = ticker
+        return cached, f"cache:{ticker}", None
+
+    live_start = tail_start_date_from_cache(cached, overlap_days=10, default_start=start)
+
+    try:
+        import yfinance as yf
+
+        s = yf.download(
+            ticker,
+            start=live_start,
+            progress=False,
+            auto_adjust=True,
+            threads=False,
+        )
+
+        if s is not None and not s.empty:
+            col = "Close" if "Close" in s.columns else ("Adj Close" if "Adj Close" in s.columns else None)
+            if col is not None:
+                obj = s[col]
+                if isinstance(obj, pd.DataFrame):
+                    ser = obj.iloc[:, 0].dropna()
+                else:
+                    ser = obj.dropna()
+
+                if not ser.empty:
+                    base_cached = load_series_cache(YF_DAILY_CACHE_DIR, ticker)
+                    merged = merge_series_keep_latest(base_cached, ser, name=ticker)
+                    save_series_cache(YF_DAILY_CACHE_DIR, ticker, merged)
+                    return merged, f"yfinance:{ticker}", None
+
+    except Exception as e:
+        err = f"{ticker}: {type(e).__name__} — {e}"
+        if cached is not None and not cached.empty:
+            cached.name = ticker
+            return cached, f"cache:{ticker}", err
+        return pd.Series(index=pd.DatetimeIndex([], name="date"), dtype=float, name=ticker), None, err
+
+    if cached is not None and not cached.empty:
+        cached.name = ticker
+        return cached, f"cache:{ticker}", None
+
+    return pd.Series(index=pd.DatetimeIndex([], name="date"), dtype=float, name=ticker), None, f"{ticker}: no data"
 
 def auto_refresh(seconds: int, enabled: bool):
     """
@@ -55,23 +193,207 @@ def save_fig_to_tempfile(fig) -> str:
     plt.close(fig)
     return tmp.name
 
-def fred_csv(series_id: str) -> pd.Series:
+_FRED_SESSION = requests.Session()
+
+# Global refresh flag used by cache-first loaders
+refresh_remote_data = False
+
+def fred_csv_live(series_id: str) -> pd.Series:
     """
-    Pull a FRED series as a pandas Series using FRED's CSV download endpoint.
-    Uses /graph/fredgraph.csv?id=SERIES which typically works without an API key.
+    Live FRED fetch only. Raises on failure.
     """
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    # FRED CSV typically has columns: DATE, <SERIES_ID>
-    date_col = df.columns[0]
-    val_col = df.columns[1]
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-    s = df.set_index(date_col)[val_col].sort_index()
-    s.name = series_id
-    return s
+    last_err = None
+
+    for attempt in range(2):
+        try:
+            r = _FRED_SESSION.get(url, timeout=12)
+            r.raise_for_status()
+
+            df = pd.read_csv(io.StringIO(r.text))
+            date_col = df.columns[0]
+            val_col = df.columns[1]
+
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+
+            s = df.set_index(date_col)[val_col].sort_index()
+            s.name = series_id
+            return s
+
+        except Exception as e:
+            last_err = e
+            if attempt < 1:
+                time.sleep(1.5)
+
+    raise RuntimeError(f"FRED live download failed for {series_id}: {last_err}")
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fred_csv(series_id: str, refresh_remote: bool = False) -> pd.Series:
+    """
+    Cache-first FRED loader.
+
+    - returns local cache immediately if present
+    - optionally tries live refresh
+    - merges and saves if refresh succeeds
+    - falls back to cache if refresh fails
+    """
+    cached = load_series_cache(FRED_CACHE_DIR, series_id)
+    if cached is not None:
+        cached.name = series_id
+
+    # Fast path: use cache immediately unless refresh requested
+    if cached is not None and not cached.empty and not refresh_remote:
+        return cached
+
+    try:
+        live = fred_csv_live(series_id)
+        merged = merge_series_keep_latest(cached, live, name=series_id)
+        save_series_cache(FRED_CACHE_DIR, series_id, merged)
+        return merged
+    except Exception as e:
+        if cached is not None and not cached.empty:
+            return cached
+        raise RuntimeError(f"FRED download failed for {series_id}: {e}")
+
+def safe_fred(series_id: str) -> pd.Series:
+    try:
+        return fred_csv(series_id, refresh_remote=refresh_remote_data)
+    except Exception as e:
+        st.warning(f"FRED series {series_id} failed: {e}")
+        return pd.Series(
+            index=pd.DatetimeIndex([], name="DATE"),
+            dtype=float,
+            name=series_id,
+        )
+
+def merge_series_keep_latest(old_s: pd.Series | None, new_s: pd.Series | None, name: str | None = None) -> pd.Series:
+    if old_s is None or len(old_s) == 0:
+        out = new_s.copy() if new_s is not None else pd.Series(dtype=float)
+    elif new_s is None or len(new_s) == 0:
+        out = old_s.copy()
+    else:
+        out = pd.concat([old_s, new_s])
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+
+    if name is not None:
+        out.name = name
+    return out
+
+
+def tail_start_date_from_cache(cached: pd.Series | None, overlap_days: int = 10, default_start: str = "1970-01-01") -> str:
+    if cached is None or len(cached) == 0:
+        return default_start
+
+    last_dt = pd.to_datetime(cached.index.max(), errors="coerce")
+    if pd.isna(last_dt):
+        return default_start
+
+    return str((last_dt - pd.Timedelta(days=overlap_days)).date())
+
+def load_gold_series_live(start="1970-01-01"):
+    """
+    Live Yahoo gold fetch only.
+    """
+    import yfinance as yf
+
+    last_err = None
+
+    for ticker in ["GC=F", "GLD", "IAU"]:
+        try:
+            s = yf.download(
+                ticker,
+                start=start,
+                progress=False,
+                auto_adjust=True,
+                threads=False,
+            )
+
+            if s is None or s.empty:
+                continue
+
+            col = "Close" if "Close" in s.columns else ("Adj Close" if "Adj Close" in s.columns else None)
+            if col is None:
+                continue
+
+            obj = s[col]
+
+            if isinstance(obj, pd.DataFrame):
+                ser = obj.iloc[:, 0].dropna()
+            else:
+                ser = obj.dropna()
+
+            if ser.empty:
+                continue
+
+            ser.name = ticker
+            return ser, f"yfinance:{ticker}", None
+
+        except Exception as e:
+            last_err = f"{ticker}: {type(e).__name__} — {e}"
+
+    return None, None, last_err
+
+def load_gold_series_fast(start="1970-01-01"):
+    """
+    Cache-first gold loader.
+
+    - use cached GC=F / GLD / IAU first if present
+    - optionally try live refresh
+    - merge and save if refresh succeeds
+    """
+    cached_series = None
+    cached_ticker = None
+
+    for ticker in ["GC=F", "GLD", "IAU"]:
+        cached = load_series_cache(YF_DAILY_CACHE_DIR, ticker)
+        if cached is not None and not cached.empty:
+            cached_series = cached
+            cached_ticker = ticker
+            break
+
+    # Fast path: use cache immediately unless refresh requested
+    if cached_series is not None and not refresh_remote_data:
+        gold_daily = cached_series.copy()
+        gold_daily.name = "GOLD_USD_D"
+
+        gold_m = cached_series.resample("ME").last()
+        gold_m.name = "GOLD_USD"
+
+        return gold_m, gold_daily, f"cache:{cached_ticker}", None
+
+    # If refreshing, only fetch recent tail when cache exists
+    live_start = tail_start_date_from_cache(cached_series, overlap_days=10, default_start=start)
+
+    live_ser, live_source, live_err = load_gold_series_live(start=live_start)
+
+    if live_ser is not None and not live_ser.empty:
+        # determine ticker from source string
+        live_ticker = live_source.split(":", 1)[1]
+        base_cached = load_series_cache(YF_DAILY_CACHE_DIR, live_ticker)
+
+        merged = merge_series_keep_latest(base_cached, live_ser, name=live_ticker)
+        save_series_cache(YF_DAILY_CACHE_DIR, live_ticker, merged)
+
+        gold_daily = merged.copy()
+        gold_daily.name = "GOLD_USD_D"
+
+        gold_m = merged.resample("ME").last()
+        gold_m.name = "GOLD_USD"
+
+        return gold_m, gold_daily, live_source, None
+
+    # live failed -> use cache if available
+    if cached_series is not None and not cached_series.empty:
+        gold_daily = cached_series.copy()
+        gold_daily.name = "GOLD_USD_D"
+
+        gold_m = cached_series.resample("ME").last()
+        gold_m.name = "GOLD_USD"
+
+        return gold_m, gold_daily, f"cache:{cached_ticker}", live_err
+
+    return None, None, None, live_err
 
 def to_monthly(s: pd.Series, method: str = "avg") -> pd.Series:
     s = s.dropna()
@@ -302,11 +624,29 @@ def classify_rsi_overlay(rsi_val: float, rsi_z: float, rsi_slope_3m: float) -> s
 def build_features(monthly_method: str = "avg") -> pd.DataFrame:
 
     # Rates
-    dgs10 = to_monthly(fred_csv("DGS10"), monthly_method)  # daily -> monthly
-    tb3ms = to_monthly(fred_csv("TB3MS"), "avg")           # already monthly, avg ok
+    dgs10 = to_monthly(safe_fred("DGS10"), monthly_method)  # daily -> monthly
+
+    # st.write("DGS10 non-null:", int(dgs10.notna().sum()))
+    # st.write("DGS10 head")
+    # st.dataframe(dgs10.head(10))
+    # st.write("DGS10 tail")
+    # st.dataframe(dgs10.tail(10))
+
+    tb3ms = to_monthly(safe_fred("TB3MS"), "avg")           # already monthly, avg ok
+
+    # ---- DEBUG ----
+    # st.write("DGS10 rows / first / last:", len(dgs10), dgs10.index.min(), dgs10.index.max())
+    # st.write("TB3MS rows / first / last:", len(tb3ms), tb3ms.index.min(), tb3ms.index.max())
+    #
+    # st.write("DGS10 tail")
+    # st.dataframe(dgs10.tail(10))
+    #
+    # st.write("TB3MS tail")
+    # st.dataframe(tb3ms.tail(10))
+    # ---------------
 
     # Inflation: CPI YoY (proxy for inflation expectations when breakevens unavailable)
-    cpi = to_monthly(fred_csv("CPIAUCSL"), "avg")
+    cpi = to_monthly(safe_fred("CPIAUCSL"), "avg")
     cpi_yoy = 100 * (cpi / cpi.shift(12) - 1.0)
     cpi_yoy.name = "CPI_YOY"
 
@@ -314,7 +654,7 @@ def build_features(monthly_method: str = "avg") -> pd.DataFrame:
     real_yield_cpi.name = "REAL_YIELD_CPI"
 
     # Breakevens: 10Y (available mainly from early 2000s onward)
-    t10yie = to_monthly(fred_csv("T10YIE"), monthly_method)
+    t10yie = to_monthly(safe_fred("T10YIE"), monthly_method)
     t10yie.name = "T10YIE"
 
     # Composite "inflation expectations" proxy:
@@ -327,8 +667,8 @@ def build_features(monthly_method: str = "avg") -> pd.DataFrame:
     real_yield_proxy.name = "REAL_YIELD_PROXY"
 
     # Dollar index: splice long history (TWEXBMTH) with modern (TWEXBGSMTH)
-    twexbmth = to_monthly(fred_csv("TWEXBMTH"), "avg")     # 1973–2019
-    twexbgsmth = to_monthly(fred_csv("TWEXBGSMTH"), "avg") # 2006–present
+    twexbmth = to_monthly(safe_fred("TWEXBMTH"), "avg")     # 1973–2019
+    twexbgsmth = to_monthly(safe_fred("TWEXBGSMTH"), "avg") # 2006–present
     usd_idx = splice_index(twexbmth, twexbgsmth)
     usd_idx.name = "USD_TWEX_SPLICE"
 
@@ -340,90 +680,35 @@ def build_features(monthly_method: str = "avg") -> pd.DataFrame:
     curve.name = "CURVE_10Y_3M"
 
     # Fiscal dominance proxy: deficit % GDP (often quarterly/annual -> ffill monthly)
-    deficit_gdp = fred_csv("FYFSGDA188S")
-    deficit_gdp = deficit_gdp.resample("ME").ffill()
+    deficit_gdp = safe_fred("FYFSGDA188S")
+    if not deficit_gdp.empty:
+        deficit_gdp = deficit_gdp.resample("ME").ffill()
+    else:
+        deficit_gdp = pd.Series(
+            index=pd.DatetimeIndex([], name="DATE"),
+            dtype=float,
+            name="DEFICIT_GDP",
+        )
     deficit_gdp.name = "DEFICIT_GDP"
 
     # --- NEW: Market real yield (TIPS) + Stress premium (HY OAS)
     # TIPS 10Y real yield (daily). Not available pre-2000s.
-    dfii10 = fred_csv("DFII10")
+    dfii10 = safe_fred("DFII10")
     dfii10_20d = dfii10.rolling(20).mean()
     real_yield_tips10 = dfii10_20d.dropna().resample("ME").last()
     real_yield_tips10.name = "REAL_YIELD_TIPS10"
 
     # High Yield OAS (daily). History starts later than 1970s.
-    hy_oas = fred_csv("BAMLH0A0HYM2")
+    hy_oas = safe_fred("BAMLH0A0HYM2")
     hy_oas_20d = hy_oas.rolling(20).mean()
     hy_oas_m = to_monthly(hy_oas_20d, monthly_method)
     hy_oas_m.name = "HY_OAS"
 
-    # Optional gold for history charts (safe if missing)
-    gold = None
-    gold_source = None
-    gold_err = None
-    gold_daily = None
+    # Optional gold for history charts
+    gold, gold_daily, gold_source, gold_err = load_gold_series_fast(start="1970-01-01")
 
-    # (A) FRED (LBMA) — removed from FRED since 2022-01-31, so likely to fail
-    for sid in ["GOLDAMGBD228NLBM", "GOLDPMGBD228NLBM"]:
-        try:
-            gold = to_monthly(fred_csv(sid), "avg")
-            gold.name = "GOLD_USD"
-            gold_source = f"FRED:{sid}"
-            break
-        except Exception as e:
-            gold_err = f"{sid}: {type(e).__name__} — {e}"
-
-    # (B) Fallback: yfinance (works without FRED)
-    if gold is None:
-        try:
-            import yfinance as yf
-
-            # Prefer more reliable Yahoo symbols over XAUUSD=X
-            for ticker in ["GC=F", "GLD"]:
-                s = yf.download(
-                    ticker,
-                    start="1970-01-01",
-                    progress=False,
-                    auto_adjust=True
-                )
-                # yfinance returns a DataFrame; use Close/Adj Close depending on availability
-                if not s.empty:
-                    col = "Close" if "Close" in s.columns else ("Adj Close" if "Adj Close" in s.columns else None)
-                    if col is None:
-                        continue
-                    obj = s[col]
-
-                    # yfinance can return a DataFrame (MultiIndex columns) even for one ticker.
-                    # Force daily gold into a 1D Series for RSI(14D).
-                    if isinstance(obj, pd.DataFrame):
-                        if obj.shape[1] == 1:
-                            ser = obj.iloc[:, 0].dropna()
-                        else:
-                            # take first column as fallback
-                            ser = obj.iloc[:, 0].dropna()
-                    else:
-                        ser = obj.dropna()
-
-                    if not ser.empty:
-                        # Keep DAILY for RSI(14D)
-                        gold_daily = ser.copy()
-                        gold_daily.name = "GOLD_USD_D"
-
-                        # Keep MONTHLY for the rest of the dashboard
-                        ser_m = ser.resample("ME").last()  # month-end
-                        ser_m.name = "GOLD_USD"
-
-                        gold = ser_m
-                        gold_source = f"yfinance:{ticker}"
-                        gold_err = None
-                        break
-
-
-            if gold is None:
-                raise ValueError("yfinance returned no data for all fallback tickers (GC=F, GLD).")
-
-        except Exception as e:
-            gold_err = f"yfinance: {type(e).__name__} — {e}"
+    if gold is None or gold.dropna().empty:
+        st.warning(f"Gold price load failed: {gold_err}")
 
     # Save diagnostics for UI
     df = pd.concat(
@@ -461,116 +746,48 @@ def build_features(monthly_method: str = "avg") -> pd.DataFrame:
     if gold is not None and not gold.empty:
         df = pd.concat([df, gold], axis=1)
 
-    # --- Market-specific indicators (QQQ trend state) ---
-    try:
-        import yfinance as yf
+    qqq_ser, qqq_source, qqq_err = load_yf_series_fast("QQQ", start="2000-01-01")
 
-        qqq = yf.download(
-            "QQQ",
-            start="2000-01-01",
-            progress=False,
-            auto_adjust=True
-        )
+    if qqq_ser is not None and not qqq_ser.empty:
+        qqq_d = qqq_ser.copy()
+        qqq_d.index = pd.to_datetime(qqq_d.index, errors="coerce")
+        qqq_d = qqq_d.sort_index()
 
-        qqq_close = None
+        qqq_m = qqq_d.resample("ME").last()
+        qqq_ma200 = qqq_d.rolling(200, min_periods=200).mean().resample("ME").last()
+        qqq_ma50 = qqq_d.rolling(50, min_periods=50).mean()
+        qqq_ma50_slope_20d = pct_slope(qqq_ma50, 20).resample("ME").last()
 
-        if qqq is not None and not qqq.empty:
-            # yfinance may return:
-            # 1) normal columns: Open/High/Low/Close/Volume
-            # 2) MultiIndex columns for a single ticker
-            if isinstance(qqq.columns, pd.MultiIndex):
-                # try to extract the "Close" level
-                if "Close" in qqq.columns.get_level_values(0):
-                    qqq_close = qqq["Close"]
-                    if isinstance(qqq_close, pd.DataFrame):
-                        qqq_close = qqq_close.iloc[:, 0]
-            else:
-                if "Close" in qqq.columns:
-                    qqq_close = qqq["Close"]
+        qqq_above_ma200 = (qqq_m > qqq_ma200).astype(float)
 
-        if qqq_close is not None:
-            qqq_close = pd.to_numeric(qqq_close, errors="coerce").dropna()
-            qqq_close.index = pd.to_datetime(qqq_close.index, errors="coerce")
-            qqq_close = qqq_close[qqq_close.index.notna()].sort_index()
-
-            # Make index tz-naive safely
-            try:
-                if getattr(qqq_close.index, "tz", None) is not None:
-                    qqq_close.index = qqq_close.index.tz_convert(None)
-            except Exception:
-                pass
-
-            # Daily trend features → month-end aligned
-            qqq_m = qqq_close.resample("ME").last()
-            qqq_ma200 = qqq_close.rolling(200).mean().resample("ME").last()
-            qqq_ma50 = qqq_close.rolling(50).mean()
-            qqq_ma50_slope_20d = pct_slope(qqq_ma50, 20).resample("ME").last()
-
-            qqq_above_ma200 = (qqq_m > qqq_ma200).astype(float)
-
-            df["QQQ_ABOVE_MA200"] = qqq_above_ma200.reindex(df.index)
-            df["QQQ_MA50_SLOPE_20D"] = qqq_ma50_slope_20d.reindex(df.index)
-        else:
-            df["QQQ_ABOVE_MA200"] = np.nan
-            df["QQQ_MA50_SLOPE_20D"] = np.nan
-
-    except Exception as e:
-        print("QQQ feature block error:", type(e).__name__, e)
+        df["QQQ_ABOVE_MA200"] = qqq_above_ma200.reindex(df.index)
+        df["QQQ_MA50_SLOPE_20D"] = qqq_ma50_slope_20d.reindex(df.index)
+    else:
         df["QQQ_ABOVE_MA200"] = np.nan
         df["QQQ_MA50_SLOPE_20D"] = np.nan
+        st.warning(f"QQQ load failed: {qqq_err}")
 
     # --- Market breadth: % of selected universe above 200D MA ---
-    try:
-        breadth_tickers = [
-            "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
-            "COST", "AMD", "WMT", "ASML", "MU", "NFLX", "PLTR", "CSCO",
-            "AMAT", "LRCX", "PEP", "INTC"
-        ]
+    breadth_tickers = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AVGO", "TSLA", "AMD", "NFLX",
+                       "COST", "WMT", "PLTR", "CSCO", "INTC", "AMAT", "LRCX", "MU", "ASML", "PEP"]
 
-        import yfinance as yf
-        breadth_raw = yf.download(
-            breadth_tickers,
-            start="2000-01-01",
-            progress=False,
-            auto_adjust=True,
-            group_by="column",
-            threads=True,
-        )
+    breadth_px, breadth_failed = load_yf_panel_fast(breadth_tickers, start="2000-01-01")
 
-        breadth_close = None
+    if not breadth_px.empty:
+        above_ma200 = pd.DataFrame({
+            c: (breadth_px[c] > breadth_px[c].rolling(200, min_periods=200).mean()).astype(float)
+            for c in breadth_px.columns
+        })
 
-        if breadth_raw is not None and not breadth_raw.empty:
-            if isinstance(breadth_raw.columns, pd.MultiIndex):
-                if "Close" in breadth_raw.columns.get_level_values(0):
-                    breadth_close = breadth_raw["Close"].copy()
-            else:
-                # fallback unlikely, but keep safe
-                if "Close" in breadth_raw.columns:
-                    breadth_close = breadth_raw[["Close"]].copy()
+        breadth_pct = above_ma200.mean(axis=1) * 100.0
+        breadth_monthly = breadth_pct.resample("ME").last()
+        breadth_monthly.name = "MARKET_BREADTH_ABOVE_MA200"
 
-        if breadth_close is not None and not breadth_close.empty:
-            breadth_close.index = pd.to_datetime(breadth_close.index, errors="coerce")
-            breadth_close = breadth_close[breadth_close.index.notna()].sort_index()
-
-            try:
-                if getattr(breadth_close.index, "tz", None) is not None:
-                    breadth_close.index = breadth_close.index.tz_convert(None)
-            except Exception:
-                pass
-
-            ma200_panel = breadth_close.rolling(200).mean()
-            above_ma200_panel = (breadth_close > ma200_panel).astype(float)
-
-            breadth_pct = above_ma200_panel.mean(axis=1) * 100.0
-            breadth_pct_m = breadth_pct.resample("ME").last()
-
-            df["MARKET_BREADTH_ABOVE_MA200"] = breadth_pct_m.reindex(df.index)
-        else:
-            df["MARKET_BREADTH_ABOVE_MA200"] = np.nan
-
-    except Exception as e:
-        print("Breadth feature block error:", type(e).__name__, e)
+        df = df.join(breadth_monthly, how="left")
+    else:
         df["MARKET_BREADTH_ABOVE_MA200"] = np.nan
+        if breadth_failed:
+            st.warning(f"Breadth load failed for {len(breadth_failed)} tickers.")
 
     print("QQQ_ABOVE_MA200 non-null:", df["QQQ_ABOVE_MA200"].notna().sum())
     print("QQQ_MA50_SLOPE_20D non-null:", df["QQQ_MA50_SLOPE_20D"].notna().sum())
@@ -634,8 +851,25 @@ def build_features(monthly_method: str = "avg") -> pd.DataFrame:
 
     # Only require non-fiscal series to align, do not stop input on the date of the smaller data set
     core_no_fiscal = ["REAL_YIELD_PROXY", "INFL_EXP_PROXY", "USD_TWEX_SPLICE", "CURVE_10Y_3M"]
+
+    print("Pre-dropna non-null counts:")
+    for c in [
+        "REAL_YIELD_PROXY",
+        "INFL_EXP_PROXY",
+        "USD_TWEX_SPLICE",
+        "CURVE_10Y_3M",
+    ]:
+        if c in df.columns:
+            print(c, int(df[c].notna().sum()))
+
     df = df.dropna(subset=core_no_fiscal, how="any")
+
+    # st.write("GOLD_USD in df:", "GOLD_USD" in df.columns)
+    # st.write("GOLD_USD non-null:", int(df["GOLD_USD"].notna().sum()) if "GOLD_USD" in df.columns else 0)
+    # st.write("Gold source used:", gold_source)
+
     return df
+
 
 def fwd_return_months(gold: pd.Series, months: int) -> pd.Series:
     """
@@ -1553,8 +1787,35 @@ with st.sidebar:
     intraday_interval = "15m"
     intraday_lookback_days = 10
 
+    if "force_refresh_data" not in st.session_state:
+        st.session_state["force_refresh_data"] = False
+
+    refresh_remote_data = bool(st.session_state.get("force_refresh_data", False))
+    st.session_state["force_refresh_data"] = False
+
     df = load_all(monthly_method)
     res_base = df.copy()
+
+    # with st.expander("Market input debug", expanded=True):
+    #     market_dbg_cols = [
+    #         "QQQ_ABOVE_MA200",
+    #         "QQQ_MA50_SLOPE_20D",
+    #         "MARKET_BREADTH_ABOVE_MA200",
+    #         "HY_OAS",
+    #     ]
+    #     market_dbg_cols = [c for c in market_dbg_cols if c in res_base.columns]
+    #
+    #     st.write("Market input sample:")
+    #     st.dataframe(
+    #         res_base[market_dbg_cols].loc["2020-01-01":"2021-12-31"].head(20),
+    #         width="stretch",
+    #         hide_index=False,
+    #     )
+    #
+    # st.write("res_base rows:", len(res_base))
+    # st.write("res_base columns:", list(res_base.columns))
+    # for c in ["GOLD_USD", "QQQ_ABOVE_MA200", "QQQ_MA50_SLOPE_20D", "MARKET_BREADTH_ABOVE_MA200"]:
+    #     st.write(c, c in res_base.columns, int(res_base[c].notna().sum()) if c in res_base.columns else 0)
 
     # ----------------------------
     # NASDAQ Screener tickers (used by Tab 2)
@@ -1863,8 +2124,29 @@ For each indicator, it shows what the platform treats as bullish, bearish, and i
     st.markdown("---")
     if st.button("Refresh data"):
         st.cache_data.clear()
+        st.session_state["force_refresh_data"] = True
         st.rerun()
 
+    refresh_remote_data = False
+
+    if st.session_state.get("force_refresh_data", False):
+        refresh_remote_data = True
+        st.session_state["force_refresh_data"] = False
+
+    # ----------------------------
+    # 8) Clear Local Data Cache
+    # ----------------------------
+
+    if st.button("Clear local data cache"):
+        for folder in [FRED_CACHE_DIR, YF_DAILY_CACHE_DIR]:
+            for p in folder.glob("*.parquet"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        st.cache_data.clear()
+        st.success("Local cache cleared.")
+        st.rerun()
 
 # Mode 1 corrected working frame
 
@@ -2211,8 +2493,16 @@ with threshold_box:
             st.markdown("---")
 
 # --- Top KPI strip
+if res.empty:
+    st.error(
+        "No usable rows were produced after feature construction. "
+        "This usually means one or more core FRED series failed and the final alignment dropped all rows."
+    )
+    st.stop()
+
 latest = res.iloc[-1]
 prev = res.iloc[-2] if len(res) > 1 else latest
+
 delta = float(latest["SIGNAL"] - prev["SIGNAL"])
 
 # --- Crisis-conditioned gold response (ONLY in Crisis mode)
@@ -2861,14 +3151,17 @@ Think of it as the main screen for understanding **gold itself**.
                 rsi14d_full.index.max() if not rsi14d_full.empty else rsi14m.index.max()
             )
 
-            if isinstance(end_dt, (float, int)):
-                # interpret as matplotlib date number (days)
-                import matplotlib.dates as mdates
-
-                end_dt = pd.Timestamp(mdates.num2date(end_dt)).tz_localize(None)
+            if pd.isna(end_dt):
+                start_dt = None
             else:
-                end_dt = pd.Timestamp(end_dt)
-            start_dt = end_dt - pd.DateOffset(months=int(lookback))
+                if isinstance(end_dt, (float, int)):
+                    import matplotlib.dates as mdates
+
+                    end_dt = pd.Timestamp(mdates.num2date(end_dt)).tz_localize(None)
+                else:
+                    end_dt = pd.Timestamp(end_dt)
+
+                start_dt = end_dt - pd.DateOffset(months=int(lookback))
 
         if start_dt is None:
             rsi14d_win = rsi14d_full
@@ -3111,178 +3404,178 @@ It creates many possible future price paths based on similar past market states.
             with right:
                 if not selected:
                     st.info("Select tickers on the left.")
-                    st.stop()
+                else:
 
-                # --- Fetch DAILY closes (2y) + build RSI + slope-based tactical state
-                # Reuse intraday_screener's yfinance helper for DAILY prices
-                close_d = intraday_screener.yf_multi_close_fixed_period(
-                    selected, interval="1d", period="2y", refresh_token=refresh_token
-                )
-
-                if close_d is None or close_d.empty:
-                    st.warning("No price data available for selected tickers.")
-                    st.stop()
-
-                p50_overlay = {}
-
-                # ---- Fetch QQQ once (used for RS vs QQQ) ----
-                try:
-                    qqq_df = intraday_screener.yf_multi_close_fixed_period(
-                        ["QQQ"],
-                        interval="1d",
-                        period="2y",
-                        refresh_token=refresh_token
-                    )
-                    qqq_px = qqq_df["QQQ"].dropna() if (
-                                qqq_df is not None and not qqq_df.empty and "QQQ" in qqq_df.columns) else pd.Series(
-                        dtype=float)
-                except Exception:
-                    qqq_px = pd.Series(dtype=float)
-
-                mc_summary_rows = []
-
-                for t in selected:
-                    px = close_d[t].dropna() if t in close_d.columns else pd.Series(dtype=float)
-                    if px.empty or px.shape[0] < 60:
-                        st.warning(f"{t}: not enough daily history for RSI/state.")
-                        continue
-
-                    r = rsi(px, period=14).dropna()
-                    r = r.reindex(px.index, method="ffill")
-                    slope = r.diff(5)  # 5 trading days slope
-                    # --- Trend filters ---
-                    ma200 = px.rolling(200).mean()
-                    above_ma200 = px > ma200
-
-                    ma50 = px.rolling(50).mean()
-                    ma50_slope = ma50.pct_change(20)
-
-                    # --- Volatility regime ---
-                    vol = px.pct_change().rolling(20).std() * np.sqrt(252)
-                    vol_q75 = vol.dropna().quantile(0.75) if not vol.dropna().empty else np.nan
-                    vol_regime = pd.Series(
-                        np.where(vol > vol_q75, "HIGH", "LOW"),
-                        index=px.index
+                    # --- Fetch DAILY closes (2y) + build RSI + slope-based tactical state
+                    # Reuse intraday_screener's yfinance helper for DAILY prices
+                    close_d = intraday_screener.yf_multi_close_fixed_period(
+                        selected, interval="1d", period="2y", refresh_token=refresh_token
                     )
 
-                    # --- Relative strength vs QQQ ---
-                    if not qqq_px.empty:
-                        rs_vs_qqq = px.pct_change(63) - qqq_px.pct_change(63)
-                        rs_vs_qqq = rs_vs_qqq.reindex(px.index)
+                    if close_d is None or close_d.empty:
+                        st.warning("No price data available for selected tickers.")
                     else:
-                        rs_vs_qqq = pd.Series(index=px.index, dtype=float)
 
-                    state = pd.Series(
-                        [
-                            mc.classify_accel_state(
-                                rv,
-                                sv,
-                                above_ma200.iloc[i] if i < len(above_ma200) else None,
-                                rs_vs_qqq.iloc[i] if i < len(rs_vs_qqq) else None,
-                                ma50_slope.iloc[i] if i < len(ma50_slope) else None,
-                                vol_regime.iloc[i] if i < len(vol_regime) else None,
+                        p50_overlay = {}
+
+                        # ---- Fetch QQQ once (used for RS vs QQQ) ----
+                        try:
+                            qqq_df = intraday_screener.yf_multi_close_fixed_period(
+                                ["QQQ"],
+                                interval="1d",
+                                period="2y",
+                                refresh_token=refresh_token
                             )
-                            for i, (rv, sv) in enumerate(zip(r.values, slope.values))
-                        ],
-                        index=px.index,
-                        name="STATE",
-                    )
+                            qqq_px = qqq_df["QQQ"].dropna() if (
+                                        qqq_df is not None and not qqq_df.empty and "QQQ" in qqq_df.columns) else pd.Series(
+                                dtype=float)
+                        except Exception:
+                            qqq_px = pd.Series(dtype=float)
 
-                    paths, state_now = mc.monte_carlo_paths_by_tactical_state_block(
-                        price=px,
-                        state=state,
-                        horizon_steps=mc_steps,
-                        n_sims=mc_n2,
-                        block_size=5,
-                        seed=7,
-                    )
+                        mc_summary_rows = []
 
-                    if paths is None:
-                        st.warning(f"{t}: not enough history in current tactical state ({state_now}).")
-                        continue
+                        for t in selected:
+                            px = close_d[t].dropna() if t in close_d.columns else pd.Series(dtype=float)
+                            if px.empty or px.shape[0] < 60:
+                                st.warning(f"{t}: not enough daily history for RSI/state.")
+                                continue
 
-                    bands = mc.mc_percentiles(paths)
-                    # store p50 for overlay
-                    p50_overlay[t] = bands["p50"].rename(t)
+                            r = rsi(px, period=14).dropna()
+                            r = r.reindex(px.index, method="ffill")
+                            slope = r.diff(5)  # 5 trading days slope
+                            # --- Trend filters ---
+                            ma200 = px.rolling(200).mean()
+                            above_ma200 = px > ma200
 
-                    if not overlay:
-                        st.markdown(f"### {t} (state: `{state_now}`)")
-                        st.line_chart(bands)
+                            ma50 = px.rolling(50).mean()
+                            ma50_slope = ma50.pct_change(20)
 
-                    # --- Horizon summary stats (always compute for combined table) ---
-                    start_price = float(px.iloc[-1])
+                            # --- Volatility regime ---
+                            vol = px.pct_change().rolling(20).std() * np.sqrt(252)
+                            vol_q75 = vol.dropna().quantile(0.75) if not vol.dropna().empty else np.nan
+                            vol_regime = pd.Series(
+                                np.where(vol > vol_q75, "HIGH", "LOW"),
+                                index=px.index
+                            )
 
-                    p10_end = float(bands["p10"].iloc[-1])
-                    p50_end = float(bands["p50"].iloc[-1])
-                    p90_end = float(bands["p90"].iloc[-1])
+                            # --- Relative strength vs QQQ ---
+                            if not qqq_px.empty:
+                                rs_vs_qqq = px.pct_change(63) - qqq_px.pct_change(63)
+                                rs_vs_qqq = rs_vs_qqq.reindex(px.index)
+                            else:
+                                rs_vs_qqq = pd.Series(index=px.index, dtype=float)
 
-                    p10_ret = (p10_end / start_price - 1.0) * 100.0
-                    p50_ret = (p50_end / start_price - 1.0) * 100.0
-                    p90_ret = (p90_end / start_price - 1.0) * 100.0
+                            state = pd.Series(
+                                [
+                                    mc.classify_accel_state(
+                                        rv,
+                                        sv,
+                                        above_ma200.iloc[i] if i < len(above_ma200) else None,
+                                        rs_vs_qqq.iloc[i] if i < len(rs_vs_qqq) else None,
+                                        ma50_slope.iloc[i] if i < len(ma50_slope) else None,
+                                        vol_regime.iloc[i] if i < len(vol_regime) else None,
+                                    )
+                                    for i, (rv, sv) in enumerate(zip(r.values, slope.values))
+                                ],
+                                index=px.index,
+                                name="STATE",
+                            )
 
-                    prob_up = float((paths[:, -1] > start_price).mean()) * 100.0
+                            paths, state_now = mc.monte_carlo_paths_by_tactical_state_block(
+                                price=px,
+                                state=state,
+                                horizon_steps=mc_steps,
+                                n_sims=mc_n2,
+                                block_size=5,
+                                seed=7,
+                            )
 
-                    if t.upper() == "GLD":
-                        structural_regime_for_ticker = str(latest.get("REGIME", "—"))  # gold structural regime
-                    else:
-                        structural_regime_for_ticker = market_regime_now  # market structural regime
+                            if paths is None:
+                                st.warning(f"{t}: not enough history in current tactical state ({state_now}).")
+                                continue
 
-                    decision = decide_trade(
-                        ticker=t,
-                        structural_regime=structural_regime_for_ticker,
-                        tactical_state=state_now,
-                        mc_typical_pct=p50_ret,
-                        mc_prob_higher_pct=prob_up,
-                        above_ma200=bool(above_ma200.iloc[-1]) if len(above_ma200.dropna()) else None,
-                    )
+                            bands = mc.mc_percentiles(paths)
+                            # store p50 for overlay
+                            p50_overlay[t] = bands["p50"].rename(t)
 
-                    mc_summary_rows.append({
-                        "Ticker": t,
-                        "Structural Regime": structural_regime_for_ticker,
-                        "State": state_now,
-                        "Decision": decision.action,
-                        "Confidence (%)": round(decision.confidence * 100, 1),
-                        "Position Size (%)": round(decision.position_size_pct * 100, 1),
-                        "Current Price": round(start_price, 2),
-                        f"Downside (p10, {mc_steps} bars)": round(p10_end, 2),
-                        f"Typical (p50, {mc_steps} bars)": round(p50_end, 2),
-                        f"Upside (p90, {mc_steps} bars)": round(p90_end, 2),
-                        "Downside %": round(p10_ret, 2),
-                        "Typical %": round(p50_ret, 2),
-                        "Upside %": round(p90_ret, 2),
-                        "Prob. Finish Higher (%)": round(prob_up, 1),
-                        "Reason": decision.reason,
-                    })
+                            if not overlay:
+                                st.markdown(f"### {t} (state: `{state_now}`)")
+                                st.line_chart(bands)
 
-                if overlay:
-                    if not p50_overlay:
-                        st.warning("Nothing to overlay (no ticker had enough state history).")
-                    else:
-                        df_overlay = pd.concat(p50_overlay.values(), axis=1)
-                        st.markdown("### Overlay (Median path only)")
-                        st.caption(
-                            "Each line is the typical (p50) simulated path under each ticker’s current tactical state.")
-                        st.line_chart(df_overlay)
+                            # --- Horizon summary stats (always compute for combined table) ---
+                            start_price = float(px.iloc[-1])
 
-                if mc_summary_rows:
-                    st.markdown("### Monte Carlo Summary Table")
-                    simple_explainer("What this table means in simple words", """
-This table puts the main Monte Carlo results for several tickers in one place.
+                            p10_end = float(bands["p10"].iloc[-1])
+                            p50_end = float(bands["p50"].iloc[-1])
+                            p90_end = float(bands["p90"].iloc[-1])
 
-It helps you compare which assets look more favorable, less favorable, or more uncertain under their current tactical setup.
-                    """)
+                            p10_ret = (p10_end / start_price - 1.0) * 100.0
+                            p50_ret = (p50_end / start_price - 1.0) * 100.0
+                            p90_ret = (p90_end / start_price - 1.0) * 100.0
 
-                    mc_summary_df = pd.DataFrame(mc_summary_rows)
+                            prob_up = float((paths[:, -1] > start_price).mean()) * 100.0
 
-                    # Sort by probability of finishing higher
-                    mc_summary_df = mc_summary_df.sort_values(
-                        "Prob. Finish Higher (%)",
-                        ascending=False
-                    )
+                            if t.upper() == "GLD":
+                                structural_regime_for_ticker = str(latest.get("REGIME", "—"))  # gold structural regime
+                            else:
+                                structural_regime_for_ticker = market_regime_now  # market structural regime
 
-                    best = mc_summary_df.iloc[0]["Ticker"]
-                    st.caption(f"Top Monte Carlo probability: **{best}**")
-                    st.dataframe(mc_summary_df,use_container_width=True,hide_index=True)
+                            decision = decide_trade(
+                                ticker=t,
+                                structural_regime=structural_regime_for_ticker,
+                                tactical_state=state_now,
+                                mc_typical_pct=p50_ret,
+                                mc_prob_higher_pct=prob_up,
+                                above_ma200=bool(above_ma200.iloc[-1]) if len(above_ma200.dropna()) else None,
+                            )
+
+                            mc_summary_rows.append({
+                                "Ticker": t,
+                                "Structural Regime": structural_regime_for_ticker,
+                                "State": state_now,
+                                "Decision": decision.action,
+                                "Confidence (%)": round(decision.confidence * 100, 1),
+                                "Position Size (%)": round(decision.position_size_pct * 100, 1),
+                                "Current Price": round(start_price, 2),
+                                f"Downside (p10, {mc_steps} bars)": round(p10_end, 2),
+                                f"Typical (p50, {mc_steps} bars)": round(p50_end, 2),
+                                f"Upside (p90, {mc_steps} bars)": round(p90_end, 2),
+                                "Downside %": round(p10_ret, 2),
+                                "Typical %": round(p50_ret, 2),
+                                "Upside %": round(p90_ret, 2),
+                                "Prob. Finish Higher (%)": round(prob_up, 1),
+                                "Reason": decision.reason,
+                            })
+
+                        if overlay:
+                            if not p50_overlay:
+                                st.warning("Nothing to overlay (no ticker had enough state history).")
+                            else:
+                                df_overlay = pd.concat(p50_overlay.values(), axis=1)
+                                st.markdown("### Overlay (Median path only)")
+                                st.caption(
+                                    "Each line is the typical (p50) simulated path under each ticker’s current tactical state.")
+                                st.line_chart(df_overlay)
+
+                        if mc_summary_rows:
+                            st.markdown("### Monte Carlo Summary Table")
+                            simple_explainer("What this table means in simple words", """
+        This table puts the main Monte Carlo results for several tickers in one place.
+        
+        It helps you compare which assets look more favorable, less favorable, or more uncertain under their current tactical setup.
+                            """)
+
+                            mc_summary_df = pd.DataFrame(mc_summary_rows)
+
+                            # Sort by probability of finishing higher
+                            mc_summary_df = mc_summary_df.sort_values(
+                                "Prob. Finish Higher (%)",
+                                ascending=False
+                            )
+
+                            best = mc_summary_df.iloc[0]["Ticker"]
+                            st.caption(f"Top Monte Carlo probability: **{best}**")
+                            st.dataframe(mc_summary_df,use_container_width=True,hide_index=True)
 
     # ----------------------------
     # TAB 4: Walk-Forward Backtest
@@ -3327,6 +3620,7 @@ It helps you compare which assets look more favorable, less favorable, or more u
 
     with tab4:
         st.subheader("Walk-Forward Macro Backtest")
+        st.write("TAB4 reached")
         simple_explainer("What this section means in simple words", """
     This section is a **historical replay**. It takes the model back in time and asks:
     "If I were living at that date, and only knew what was available then, what would the platform have said?"
@@ -3363,12 +3657,18 @@ It helps you compare which assets look more favorable, less favorable, or more u
             bt_fwd = int(st.slider("Forward horizon (months)", 1, 12, 12, 1, key="bt_fwd"))
 
         with b4:
-            bt_price_col = st.selectbox(
-                "Price series",
-                [c for c in ["GOLD_USD", "GLD"] if c in res_base.columns] or ["GOLD_USD"],
-                index=0,
-                key="bt_price_col",
-            )
+            price_options = [c for c in ["GOLD_USD", "GLD"] if c in res_base.columns]
+
+            if not price_options:
+                st.warning("No gold price series is currently available in the dataset (GOLD_USD / GLD missing).")
+                bt_price_col = None
+            else:
+                bt_price_col = st.selectbox(
+                    "Price series",
+                    price_options,
+                    index=0,
+                    key="bt_price_col",
+                )
 
         with b5:
             bt_initial_capital = float(
@@ -3720,6 +4020,8 @@ It helps you compare which assets look more favorable, less favorable, or more u
             return _compute_bt_row
 
 
+        portfolio_df = pd.DataFrame()
+
         # ----------------------------
         # Run primary backtest
         # ----------------------------
@@ -3740,119 +4042,119 @@ It helps you compare which assets look more favorable, less favorable, or more u
             config=bt_cfg,
         )
 
-        with st.expander("Primary run window", expanded=True):
-            if not bt_df.empty and "as_of_date" in bt_df.columns:
-                d = pd.to_datetime(bt_df["as_of_date"], errors="coerce")
-                st.write({
-                    "rows": int(len(bt_df)),
-                    "min_date": str(d.min()),
-                    "max_date": str(d.max()),
-                })
+        # with st.expander("Primary run window", expanded=True):
+        #     if not bt_df.empty and "as_of_date" in bt_df.columns:
+        #         d = pd.to_datetime(bt_df["as_of_date"], errors="coerce")
+        #         st.write({
+        #             "rows": int(len(bt_df)),
+        #             "min_date": str(d.min()),
+        #             "max_date": str(d.max()),
+        #         })
 
-        with st.expander("Replay Decision Debug", expanded=False):
-
-            st.write("Primary bt_df columns:")
-            st.write(list(bt_df.columns))
-
-            if "decision" in bt_df.columns:
-                st.write("Primary decision counts:")
-                st.write(bt_df["decision"].astype(str).value_counts(dropna=False))
-                st.write("Primary decision null count:", int(bt_df["decision"].isna().sum()))
-            else:
-                st.error("Primary bt_df is missing the 'decision' column.")
-
-            debug_cols = [c for c in [
-                "as_of_date",
-                "strategy_rule",
-                "gold_signal",
-                "gold_regime",
-                "market_signal",
-                "market_regime",
-                "accel_signal",
-                "accel_regime",
-                "macro_state",
-                "macro_score",
-                "decision",
-                "decision_confidence",
-                "position_size_pct",
-                "signal_action",
-                "signal_confidence",
-                "reason",
-                "error",
-            ] if c in bt_df.columns]
-
-            if debug_cols:
-                st.write("Primary replay sample:")
-                st.dataframe(bt_df[debug_cols].head(25), width="stretch", hide_index=True)
-
-            primary_macro_debug_cols = [c for c in [
-                "as_of_date",
-                "gold_signal",
-                "gold_regime",
-                "market_signal",
-                "market_regime",
-                "accel_signal",
-                "accel_regime",
-                "macro_score",
-                "macro_state",
-                "decision",
-                "reason",
-            ] if c in bt_df.columns]
-
-            st.write("Primary macro input sample:")
-            st.dataframe(
-                bt_df[primary_macro_debug_cols].head(25),
-                width="stretch",
-                hide_index=True,
-            )
-
-            if "error" in bt_df.columns and bt_df["error"].notna().any():
-                st.warning("Replay row errors detected in primary strategy")
-                st.dataframe(
-                    bt_df.loc[bt_df["error"].notna(), ["as_of_date", "error"]].head(20),
-                    width="stretch",
-                    hide_index=True,
-                )
-
-        with st.expander("Primary decision counts", expanded=True):
-            if "decision" in bt_df.columns:
-                st.write(bt_df["decision"].astype(str).value_counts(dropna=False))
-
-        with st.expander("Primary BUY rows", expanded=False):
-            if "decision" in bt_df.columns:
-                buy_rows = bt_df[bt_df["decision"].astype(str).str.upper() == "BUY"].copy()
-
-                cols = [c for c in [
-                    "as_of_date",
-                    "gold_signal",
-                    "market_signal",
-                    "accel_signal",
-                    "macro_score",
-                    "macro_state",
-                    "decision",
-                    "decision_confidence",
-                    "reason"
-                ] if c in buy_rows.columns]
-
-                st.dataframe(buy_rows[cols], use_container_width=True, hide_index=True)
-
-        with st.expander("Primary WATCH rows", expanded=False):
-            if "decision" in bt_df.columns:
-                watch_rows = bt_df[bt_df["decision"].astype(str).str.upper() == "WATCH"].copy()
-
-                cols = [c for c in [
-                    "as_of_date",
-                    "gold_signal",
-                    "market_signal",
-                    "accel_signal",
-                    "macro_score",
-                    "macro_state",
-                    "decision",
-                    "decision_confidence",
-                    "reason"
-                ] if c in watch_rows.columns]
-
-                st.dataframe(watch_rows[cols], use_container_width=True, hide_index=True)
+        # with st.expander("Replay Decision Debug", expanded=False):
+        #
+        #     st.write("Primary bt_df columns:")
+        #     st.write(list(bt_df.columns))
+        #
+        #     if "decision" in bt_df.columns:
+        #         st.write("Primary decision counts:")
+        #         st.write(bt_df["decision"].astype(str).value_counts(dropna=False))
+        #         st.write("Primary decision null count:", int(bt_df["decision"].isna().sum()))
+        #     else:
+        #         st.error("Primary bt_df is missing the 'decision' column.")
+        #
+        #     debug_cols = [c for c in [
+        #         "as_of_date",
+        #         "strategy_rule",
+        #         "gold_signal",
+        #         "gold_regime",
+        #         "market_signal",
+        #         "market_regime",
+        #         "accel_signal",
+        #         "accel_regime",
+        #         "macro_state",
+        #         "macro_score",
+        #         "decision",
+        #         "decision_confidence",
+        #         "position_size_pct",
+        #         "signal_action",
+        #         "signal_confidence",
+        #         "reason",
+        #         "error",
+        #     ] if c in bt_df.columns]
+        #
+        #     if debug_cols:
+        #         st.write("Primary replay sample:")
+        #         st.dataframe(bt_df[debug_cols].head(25), width="stretch", hide_index=True)
+        #
+        #     primary_macro_debug_cols = [c for c in [
+        #         "as_of_date",
+        #         "gold_signal",
+        #         "gold_regime",
+        #         "market_signal",
+        #         "market_regime",
+        #         "accel_signal",
+        #         "accel_regime",
+        #         "macro_score",
+        #         "macro_state",
+        #         "decision",
+        #         "reason",
+        #     ] if c in bt_df.columns]
+        #
+        #     st.write("Primary macro input sample:")
+        #     st.dataframe(
+        #         bt_df[primary_macro_debug_cols].head(25),
+        #         width="stretch",
+        #         hide_index=True,
+        #     )
+        #
+        #     if "error" in bt_df.columns and bt_df["error"].notna().any():
+        #         st.warning("Replay row errors detected in primary strategy")
+        #         st.dataframe(
+        #             bt_df.loc[bt_df["error"].notna(), ["as_of_date", "error"]].head(20),
+        #             width="stretch",
+        #             hide_index=True,
+        #         )
+        #
+        # with st.expander("Primary decision counts", expanded=True):
+        #     if "decision" in bt_df.columns:
+        #         st.write(bt_df["decision"].astype(str).value_counts(dropna=False))
+        #
+        # with st.expander("Primary BUY rows", expanded=False):
+        #     if "decision" in bt_df.columns:
+        #         buy_rows = bt_df[bt_df["decision"].astype(str).str.upper() == "BUY"].copy()
+        #
+        #         cols = [c for c in [
+        #             "as_of_date",
+        #             "gold_signal",
+        #             "market_signal",
+        #             "accel_signal",
+        #             "macro_score",
+        #             "macro_state",
+        #             "decision",
+        #             "decision_confidence",
+        #             "reason"
+        #         ] if c in buy_rows.columns]
+        #
+        #         st.dataframe(buy_rows[cols], use_container_width=True, hide_index=True)
+        #
+        # with st.expander("Primary WATCH rows", expanded=False):
+        #     if "decision" in bt_df.columns:
+        #         watch_rows = bt_df[bt_df["decision"].astype(str).str.upper() == "WATCH"].copy()
+        #
+        #         cols = [c for c in [
+        #             "as_of_date",
+        #             "gold_signal",
+        #             "market_signal",
+        #             "accel_signal",
+        #             "macro_score",
+        #             "macro_state",
+        #             "decision",
+        #             "decision_confidence",
+        #             "reason"
+        #         ] if c in watch_rows.columns]
+        #
+        #         st.dataframe(watch_rows[cols], use_container_width=True, hide_index=True)
 
         bt_df["signal_action"] = bt_df["decision"] if "decision" in bt_df.columns else np.nan
         bt_df["signal_confidence"] = bt_df["decision_confidence"] if "decision_confidence" in bt_df.columns else np.nan
@@ -3875,66 +4177,144 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 seed=7,
             )
 
-            mc_validation_df = run_walkforward_mc_validation(
-                replay_df=bt_df,
-                full_price=res_base[bt_price_col],
-                benchmark_price=res_base["QQQ"] if "QQQ" in res_base.columns else None,
-                horizon_months=int(bt_fwd),
-                cfg=mc_cfg,
-            )
+            mc_validation_df = pd.DataFrame()
+            mc_validation_summary = {}
 
-            if mc_validation_df is not None and not mc_validation_df.empty:
-                bt_df = mc_validation_df
-                mc_validation_summary = summarize_mc_validation(mc_validation_df)
+            if wf_mc_enabled and bt_price_col is not None:
+                mc_validation_df = run_walkforward_mc_validation(
+                    replay_df=bt_df,
+                    full_price=res_base[bt_price_col],
+                    benchmark_price=res_base["QQQ"] if "QQQ" in res_base.columns else None,
+                    horizon_months=int(bt_fwd),
+                    cfg=mc_cfg,
+                )
 
-        with st.expander("Primary pre-portfolio debug", expanded=False):
-            st.write("Primary bt_df columns before _prepare_bt_for_portfolio:")
-            st.write(list(bt_df.columns))
+                if mc_validation_df is not None and not mc_validation_df.empty:
+                    bt_df = mc_validation_df
+                    mc_validation_summary = summarize_mc_validation(mc_validation_df)
+            elif wf_mc_enabled and bt_price_col is None:
+                st.info("MC validation skipped because no usable price series is available.")
 
+        market_trace_cols = [
+            "QQQ_ABOVE_MA200",
+            "QQQ_MA50_SLOPE_20D",
+            "MARKET_BREADTH_ABOVE_MA200",
+            "HY_OAS",
+        ]
+
+        market_trace = bt_df[["as_of_date", "market_signal", "market_regime"]].copy()
+
+        src = res_base.copy().reset_index()
+
+        # robust date-column normalization
+        if "as_of_date" in src.columns:
+            pass
+        elif "DATE" in src.columns:
+            src = src.rename(columns={"DATE": "as_of_date"})
+        elif "date" in src.columns:
+            src = src.rename(columns={"date": "as_of_date"})
+        elif "index" in src.columns:
+            src = src.rename(columns={"index": "as_of_date"})
+        else:
+            st.warning(f"Market trace debug: could not find date column in res_base. Columns: {list(src.columns)}")
+
+        keep_cols = ["as_of_date"] + [c for c in market_trace_cols if c in src.columns]
+
+        if "as_of_date" in src.columns:
+            src = src[keep_cols].copy()
+
+            market_trace["as_of_date"] = pd.to_datetime(market_trace["as_of_date"], errors="coerce")
+            src["as_of_date"] = pd.to_datetime(src["as_of_date"], errors="coerce")
+
+            market_trace = market_trace.merge(src, on="as_of_date", how="left")
+
+            with st.expander("Market signal trace", expanded=True):
+                st.dataframe(
+                    market_trace.head(20),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        # st.write("Primary decision counts:",
+        #          bt_df["decision"].value_counts(
+        #              dropna=False).to_dict() if bt_df is not None and "decision" in bt_df.columns else {})
+
+        buy_cols = [
+            "as_of_date",
+            "gold_signal",
+            "market_signal",
+            "accel_signal",
+            "macro_score",
+            "macro_state",
+            "decision",
+            "decision_confidence",
+            "position_size_pct",
+            "reason",
+        ]
+
+        # if bt_df is not None and not bt_df.empty:
+        #     st.write("Primary BUY rows:")
+        #     st.dataframe(
+        #         bt_df.loc[bt_df["decision"].astype(str).str.upper() == "BUY", buy_cols],
+        #         width="stretch",
+        #         hide_index=True,
+        #     )
+
+            # st.write("Primary WATCH rows:")
+            # st.dataframe(
+            #     bt_df.loc[bt_df["decision"].astype(str).str.upper() == "WATCH", buy_cols].head(15),
+            #     width="stretch",
+            #     hide_index=True,
+            # )
+
+        # with st.expander("Primary pre-portfolio debug", expanded=False):
+        #     st.write("Primary bt_df columns before _prepare_bt_for_portfolio:")
+        #     st.write(list(bt_df.columns))
+        #
         bt_df_for_port = _prepare_bt_for_portfolio(bt_df, bt_trading_mode)
-
-        with st.expander("DEBUG SUMMARY BEFORE PORTFOLIO (new)", expanded=True):
-            dbg = bt_df_for_port.copy()
-
-            st.write("columns:", list(dbg.columns))
-
-            if "decision" in dbg.columns:
-                st.write("decision counts")
-                st.write(dbg["decision"].astype(str).value_counts(dropna=False))
-
-            if "signal_action" in dbg.columns:
-                st.write("signal_action counts")
-                st.write(dbg["signal_action"].astype(str).value_counts(dropna=False))
-
-            if "position_size_pct" in dbg.columns:
-                st.write("position_size_pct counts")
-                st.write(dbg["position_size_pct"].value_counts(dropna=False).sort_index())
-
-            cols = [c for c in
-                    ["as_of_date", "decision", "signal_action", "signal_confidence", "position_size_pct", "reason"] if
-                    c in dbg.columns]
-            st.write("head")
-            st.dataframe(dbg[cols].head(15), use_container_width=True, hide_index=True)
-
-        with st.expander("Primary bt_df_for_port debug", expanded=True):
-            cols = [c for c in [
-                "as_of_date",
-                "decision",
-                "signal_action",
-                "position_size_pct",
-                "signal_confidence",
-                "reason",
-            ] if c in bt_df_for_port.columns]
-            st.dataframe(bt_df_for_port[cols].head(25), use_container_width=True, hide_index=True)
-
-            if "signal_action" in bt_df_for_port.columns:
-                st.write("signal_action counts")
-                st.write(bt_df_for_port["signal_action"].astype(str).value_counts(dropna=False))
-
-            if "position_size_pct" in bt_df_for_port.columns:
-                st.write("position_size_pct counts")
-                st.write(bt_df_for_port["position_size_pct"].value_counts(dropna=False).sort_index())
-
+        #
+        # with st.expander("DEBUG SUMMARY BEFORE PORTFOLIO (new)", expanded=True):
+        #     dbg = bt_df_for_port.copy()
+        #
+        #     st.write("columns:", list(dbg.columns))
+        #
+        #     if "decision" in dbg.columns:
+        #         st.write("decision counts")
+        #         st.write(dbg["decision"].astype(str).value_counts(dropna=False))
+        #
+        #     if "signal_action" in dbg.columns:
+        #         st.write("signal_action counts")
+        #         st.write(dbg["signal_action"].astype(str).value_counts(dropna=False))
+        #
+        #     if "position_size_pct" in dbg.columns:
+        #         st.write("position_size_pct counts")
+        #         st.write(dbg["position_size_pct"].value_counts(dropna=False).sort_index())
+        #
+        #     cols = [c for c in
+        #             ["as_of_date", "decision", "signal_action", "signal_confidence", "position_size_pct", "reason"] if
+        #             c in dbg.columns]
+        #     st.write("head")
+        #     st.dataframe(dbg[cols].head(15), use_container_width=True, hide_index=True)
+        #
+        # with st.expander("Primary bt_df_for_port debug", expanded=True):
+        #     cols = [c for c in [
+        #         "as_of_date",
+        #         "decision",
+        #         "signal_action",
+        #         "position_size_pct",
+        #         "signal_confidence",
+        #         "reason",
+        #     ] if c in bt_df_for_port.columns]
+        #     st.dataframe(bt_df_for_port[cols].head(25), use_container_width=True, hide_index=True)
+        #
+        #     if "signal_action" in bt_df_for_port.columns:
+        #         st.write("signal_action counts")
+        #         st.write(bt_df_for_port["signal_action"].astype(str).value_counts(dropna=False))
+        #
+        #     if "position_size_pct" in bt_df_for_port.columns:
+        #         st.write("position_size_pct counts")
+        #         st.write(bt_df_for_port["position_size_pct"].value_counts(dropna=False).sort_index())
+        #
         portfolio_df = build_portfolio_backtest(
             bt_df_for_port,
             initial_capital=float(bt_initial_capital),
@@ -3949,67 +4329,122 @@ It helps you compare which assets look more favorable, less favorable, or more u
             stop_loss_pct=float(bt_stop_loss_pct),
             take_profit_pct=float(bt_take_profit_pct),
         )
+        # st.write("bt_price_col:", bt_price_col)
+        # st.write("bt_df rows:", 0 if bt_df is None else len(bt_df))
+        # st.write("bt_df rows:", 0 if bt_df is None else len(bt_df))
+        # st.write("bt_df_for_port rows:", 0 if bt_df_for_port is None else len(bt_df_for_port))
+        # st.write("portfolio_df rows:", 0 if portfolio_df is None else len(portfolio_df))
 
-        with st.expander("DEBUG SUMMARY AFTER PORTFOLIO", expanded=True):
-            dbg = portfolio_df.copy()
+        # # --- DEBUG: portfolio diagnostics ---
+        # st.write("PRIMARY portfolio rows:", len(portfolio_df) if portfolio_df is not None else None)
+        #
+        # st.write(
+        #     "PRIMARY min/max drawdown:",
+        #     None if portfolio_df is None or portfolio_df.empty else (
+        #         float(portfolio_df["drawdown_pct"].min()),
+        #         float(portfolio_df["drawdown_pct"].max())
+        #     )
+        # )
+        #
+        # st.write(
+        #     "PRIMARY position_after_pct unique:",
+        #     [] if portfolio_df is None or portfolio_df.empty else
+        #     sorted(portfolio_df["position_after_pct"].dropna().unique().tolist())[:20]
+        # )
+        #
+        # st.write(
+        #     "PRIMARY executed_trade counts:",
+        #     {} if portfolio_df is None or portfolio_df.empty else
+        #     portfolio_df["executed_trade"].value_counts(dropna=False).to_dict()
+        # )
 
-            st.write("columns:", list(dbg.columns))
+        # --- DEBUG preview ---
+        cols_dbg = [
+            "as_of_date",
+            "decision",
+            "signal_action",
+            "position_size_pct",
+            "executed_trade",
+            "position_before_pct",
+            "position_after_pct",
+            "strategy_period_return_pct",
+            "equity_curve",
+            "drawdown_pct"
+        ]
 
-            for col in ["raw_action", "confirmed_action", "executed_trade", "position_after_label"]:
-                if col in dbg.columns:
-                    st.write(f"{col} counts")
-                    st.write(dbg[col].astype(str).value_counts(dropna=False))
+        if portfolio_df is not None and not portfolio_df.empty:
+            st.dataframe(
+                portfolio_df[cols_dbg].head(10),
+                width="stretch",
+                hide_index=True
+            )
 
-            for col in ["position_after_pct", "applied_position_pct", "turnover_pct"]:
-                if col in dbg.columns:
-                    st.write(f"{col} counts")
-                    st.write(dbg[col].value_counts(dropna=False).sort_index())
+        #
+        # with st.expander("DEBUG SUMMARY AFTER PORTFOLIO", expanded=True):
+        #     dbg = portfolio_df.copy()
+        #
+        #     st.write("columns:", list(dbg.columns))
+        #
+        #     for col in ["raw_action", "confirmed_action", "executed_trade", "position_after_label"]:
+        #         if col in dbg.columns:
+        #             st.write(f"{col} counts")
+        #             st.write(dbg[col].astype(str).value_counts(dropna=False))
+        #
+        #     for col in ["position_after_pct", "applied_position_pct", "turnover_pct"]:
+        #         if col in dbg.columns:
+        #             st.write(f"{col} counts")
+        #             st.write(dbg[col].value_counts(dropna=False).sort_index())
+        #
+        #     cols = [c for c in [
+        #         "as_of_date",
+        #         "decision",
+        #         "signal_action",
+        #         "raw_action",
+        #         "confirmed_action",
+        #         "executed_trade",
+        #         "position_before_pct",
+        #         "position_after_pct",
+        #         "applied_position_pct",
+        #         "turnover_pct",
+        #         "strategy_period_return_pct",
+        #         "stop_triggered",
+        #         "take_profit_triggered",
+        #     ] if c in dbg.columns]
+        #
+        #     st.write("head")
+        #     st.dataframe(dbg[cols].head(20), use_container_width=True, hide_index=True)
+        #
+        # with st.expander("Primary portfolio_df debug", expanded=True):
+        #     cols = [c for c in [
+        #         "as_of_date",
+        #         "decision",
+        #         "signal_action",
+        #         "position_size_pct",
+        #         "raw_action",
+        #         "confirmed_action",
+        #         "signal_confirmed",
+        #         "executed_trade",
+        #         "position_before_label",
+        #         "position_before_pct",
+        #         "position_after_label",
+        #         "position_after_pct",
+        #         "applied_position_pct",
+        #         "next_position_pct",
+        #         "turnover_pct",
+        #         "strategy_period_return_pct",
+        #         "stop_triggered",
+        #         "take_profit_triggered",
+        #         "equity_curve",
+        #     ] if c in portfolio_df.columns]
+        #     st.dataframe(portfolio_df[cols].head(30), use_container_width=True, hide_index=True)
 
-            cols = [c for c in [
-                "as_of_date",
-                "decision",
-                "signal_action",
-                "raw_action",
-                "confirmed_action",
-                "executed_trade",
-                "position_before_pct",
-                "position_after_pct",
-                "applied_position_pct",
-                "turnover_pct",
-                "strategy_period_return_pct",
-                "stop_triggered",
-                "take_profit_triggered",
-            ] if c in dbg.columns]
-
-            st.write("head")
-            st.dataframe(dbg[cols].head(20), use_container_width=True, hide_index=True)
-
-        with st.expander("Primary portfolio_df debug", expanded=True):
-            cols = [c for c in [
-                "as_of_date",
-                "decision",
-                "signal_action",
-                "position_size_pct",
-                "raw_action",
-                "confirmed_action",
-                "signal_confirmed",
-                "executed_trade",
-                "position_before_label",
-                "position_before_pct",
-                "position_after_label",
-                "position_after_pct",
-                "applied_position_pct",
-                "next_position_pct",
-                "turnover_pct",
-                "strategy_period_return_pct",
-                "stop_triggered",
-                "take_profit_triggered",
-                "equity_curve",
-            ] if c in portfolio_df.columns]
-            st.dataframe(portfolio_df[cols].head(30), use_container_width=True, hide_index=True)
-
-        bt_stats = compute_backtest_analytics(portfolio_df, periods_per_year=float(
-            periods_per_year)) if not portfolio_df.empty else {}
+        if portfolio_df is None or portfolio_df.empty:
+            bt_stats = {}
+        else:
+            bt_stats = compute_backtest_analytics(
+                portfolio_df,
+                periods_per_year=float(periods_per_year)
+            )
 
         # ----------------------------
         # Run comparison backtest
@@ -4042,84 +4477,84 @@ It helps you compare which assets look more favorable, less favorable, or more u
             compare_bt_df["signal_confidence"] = compare_bt_df[
                 "decision_confidence"] if "decision_confidence" in compare_bt_df.columns else np.nan
 
-            with st.expander("Comparison Replay Debug", expanded=False):
-                st.write("Comparison bt_df columns:")
-                st.write(list(compare_bt_df.columns))
-
-                if "decision" in compare_bt_df.columns:
-                    st.write("Comparison decision counts:")
-                    st.write(compare_bt_df["decision"].astype(str).value_counts(dropna=False))
-                    st.write("Comparison decision null count:", int(compare_bt_df["decision"].isna().sum()))
-                else:
-                    st.error("Comparison bt_df is missing the 'decision' column.")
-
-                cmp_debug_cols = [c for c in [
-                    "as_of_date",
-                    "strategy_rule",
-                    "gold_signal",
-                    "gold_regime",
-                    "market_signal",
-                    "market_regime",
-                    "accel_signal",
-                    "accel_regime",
-                    "macro_state",
-                    "macro_score",
-                    "decision",
-                    "decision_confidence",
-                    "position_size_pct",
-                    "signal_action",
-                    "signal_confidence",
-                    "reason",
-                    "error",
-                ] if c in compare_bt_df.columns]
-
-                if cmp_debug_cols:
-                    st.write("Comparison replay sample:")
-                    st.dataframe(compare_bt_df[cmp_debug_cols].head(25), width="stretch", hide_index=True)
-
-                cmp_macro_debug_cols = [c for c in [
-                    "as_of_date",
-                    "gold_signal",
-                    "gold_regime",
-                    "market_signal",
-                    "market_regime",
-                    "accel_signal",
-                    "accel_regime",
-                    "macro_score",
-                    "macro_state",
-                    "decision",
-                    "reason",
-                ] if c in compare_bt_df.columns]
-
-                if cmp_macro_debug_cols:
-                    st.write("Comparison macro input sample:")
-                    st.dataframe(compare_bt_df[cmp_macro_debug_cols].head(25), width="stretch", hide_index=True)
-
-                if "error" in compare_bt_df.columns and compare_bt_df["error"].notna().any():
-                    st.warning("Replay row errors detected in comparison strategy")
-                    st.dataframe(
-                        compare_bt_df.loc[compare_bt_df["error"].notna(), ["as_of_date", "error"]].head(20),
-                        width="stretch",
-                        hide_index=True,
-                    )
-
-            with st.expander("Comparison pre-portfolio debug", expanded=False):
-                st.write("Comparison bt_df columns before _prepare_bt_for_portfolio:")
-                st.write(list(compare_bt_df.columns))
+            # with st.expander("Comparison Replay Debug", expanded=False):
+            #     st.write("Comparison bt_df columns:")
+            #     st.write(list(compare_bt_df.columns))
+            #
+            #     if "decision" in compare_bt_df.columns:
+            #         st.write("Comparison decision counts:")
+            #         st.write(compare_bt_df["decision"].astype(str).value_counts(dropna=False))
+            #         st.write("Comparison decision null count:", int(compare_bt_df["decision"].isna().sum()))
+            #     else:
+            #         st.error("Comparison bt_df is missing the 'decision' column.")
+            #
+            #     cmp_debug_cols = [c for c in [
+            #         "as_of_date",
+            #         "strategy_rule",
+            #         "gold_signal",
+            #         "gold_regime",
+            #         "market_signal",
+            #         "market_regime",
+            #         "accel_signal",
+            #         "accel_regime",
+            #         "macro_state",
+            #         "macro_score",
+            #         "decision",
+            #         "decision_confidence",
+            #         "position_size_pct",
+            #         "signal_action",
+            #         "signal_confidence",
+            #         "reason",
+            #         "error",
+            #     ] if c in compare_bt_df.columns]
+            #
+            #     if cmp_debug_cols:
+            #         st.write("Comparison replay sample:")
+            #         st.dataframe(compare_bt_df[cmp_debug_cols].head(25), width="stretch", hide_index=True)
+            #
+            #     cmp_macro_debug_cols = [c for c in [
+            #         "as_of_date",
+            #         "gold_signal",
+            #         "gold_regime",
+            #         "market_signal",
+            #         "market_regime",
+            #         "accel_signal",
+            #         "accel_regime",
+            #         "macro_score",
+            #         "macro_state",
+            #         "decision",
+            #         "reason",
+            #     ] if c in compare_bt_df.columns]
+            #
+            #     if cmp_macro_debug_cols:
+            #         st.write("Comparison macro input sample:")
+            #         st.dataframe(compare_bt_df[cmp_macro_debug_cols].head(25), width="stretch", hide_index=True)
+            #
+            #     if "error" in compare_bt_df.columns and compare_bt_df["error"].notna().any():
+            #         st.warning("Replay row errors detected in comparison strategy")
+            #         st.dataframe(
+            #             compare_bt_df.loc[compare_bt_df["error"].notna(), ["as_of_date", "error"]].head(20),
+            #             width="stretch",
+            #             hide_index=True,
+            #         )
+            #
+            # with st.expander("Comparison pre-portfolio debug", expanded=False):
+            #     st.write("Comparison bt_df columns before _prepare_bt_for_portfolio:")
+            #     st.write(list(compare_bt_df.columns))
 
             #---------- Comparison backtest start
 
             compare_bt_df_for_port = _prepare_bt_for_portfolio(compare_bt_df, compare_trading_mode)
 
-            with st.expander("Comparison bt_df_for_port debug", expanded=True):
-                dbg_cols = [c for c in [
-                    "as_of_date",
-                    "decision",
-                    "signal_action",
-                    "position_size_pct",
-                    "signal_confidence",
-                ] if c in compare_bt_df_for_port.columns]
-                st.dataframe(compare_bt_df_for_port[dbg_cols].head(40), use_container_width=True)
+            # with st.expander("Comparison bt_df_for_port debug", expanded=True):
+            #     dbg_cols = [c for c in [
+            #         "as_of_date",
+            #         "decision",
+            #         "signal_action",
+            #         "position_size_pct",
+            #         "signal_confidence",
+            #     ] if c in compare_bt_df_for_port.columns]
+            #     st.dataframe(compare_bt_df_for_port[dbg_cols].head(40), use_container_width=True)
 
             compare_portfolio_df = build_portfolio_backtest(
                 compare_bt_df_for_port,
@@ -4136,47 +4571,47 @@ It helps you compare which assets look more favorable, less favorable, or more u
                 take_profit_pct=float(bt_take_profit_pct),
             )
 
-            with st.expander("Comparison Portfolio Debug", expanded=True):
-                dbg_cols = [c for c in [
-                    "as_of_date",
-                    "decision",
-                    "signal_action",
-                    "position_size_pct",
-                    "raw_action",
-                    "confirmed_action",
-                    "signal_confirmed",
-                    "executed_trade",
-                    "position_before_pct",
-                    "position_after_pct",
-                    "applied_position_pct",
-                    "next_position_pct",
-                    "strategy_period_return_pct",
-                    "equity_curve",
-                ] if c in compare_portfolio_df.columns]
-
-                st.dataframe(compare_portfolio_df[dbg_cols].head(40), use_container_width=True)
+            # with st.expander("Comparison Portfolio Debug", expanded=True):
+            #     dbg_cols = [c for c in [
+            #         "as_of_date",
+            #         "decision",
+            #         "signal_action",
+            #         "position_size_pct",
+            #         "raw_action",
+            #         "confirmed_action",
+            #         "signal_confirmed",
+            #         "executed_trade",
+            #         "position_before_pct",
+            #         "position_after_pct",
+            #         "applied_position_pct",
+            #         "next_position_pct",
+            #         "strategy_period_return_pct",
+            #         "equity_curve",
+            #     ] if c in compare_portfolio_df.columns]
+            #
+            #     st.dataframe(compare_portfolio_df[dbg_cols].head(40), use_container_width=True)
 
             # ---- DEBUG BLOCK (add here) ----
-            with st.expander("Comparison Portfolio Debug", expanded=False):
-                st.write("Comparison portfolio_df columns:")
-                st.write(list(compare_portfolio_df.columns))
-
-                dbg_cols = [c for c in [
-                    "as_of_date",
-                    "decision",
-                    "signal_action",
-                    "position_size_pct",
-                    "executed_trade",
-                    "position_before_pct",
-                    "position_after_pct",
-                    "position_before_label",
-                    "position_after_label",
-                    "strategy_period_return_pct",
-                    "equity_curve",
-                ] if c in compare_portfolio_df.columns]
-
-                if dbg_cols:
-                    st.dataframe(compare_portfolio_df[dbg_cols].head(25), width="stretch", hide_index=True)
+            # with st.expander("Comparison Portfolio Debug", expanded=False):
+            #     st.write("Comparison portfolio_df columns:")
+            #     st.write(list(compare_portfolio_df.columns))
+            #
+            #     dbg_cols = [c for c in [
+            #         "as_of_date",
+            #         "decision",
+            #         "signal_action",
+            #         "position_size_pct",
+            #         "executed_trade",
+            #         "position_before_pct",
+            #         "position_after_pct",
+            #         "position_before_label",
+            #         "position_after_label",
+            #         "strategy_period_return_pct",
+            #         "equity_curve",
+            #     ] if c in compare_portfolio_df.columns]
+            #
+            #     if dbg_cols:
+            #         st.dataframe(compare_portfolio_df[dbg_cols].head(25), width="stretch", hide_index=True)
 
             compare_stats = compute_backtest_analytics(
                 compare_portfolio_df,
@@ -4686,145 +5121,152 @@ It helps you compare which assets look more favorable, less favorable, or more u
         This lets you judge visually how accurate the cone was for that specific historical start date.
                     """)
 
-                price_full = pd.to_numeric(res_base[bt_price_col], errors="coerce").dropna().astype(float).sort_index()
-                anchor_ts = pd.Timestamp(bt_start)
-
-                hist_px = price_full.loc[price_full.index <= anchor_ts].copy()
-
-                if hist_px.empty:
-                    st.info("No price history available up to the selected Start date.")
+                if bt_price_col is None or bt_price_col not in res_base.columns:
+                    st.info("Historical cone replay unavailable because no price series is available.")
                 else:
-                    anchor_used = hist_px.index[-1]
-                    start_price = float(hist_px.iloc[-1])
+                    price_full = pd.to_numeric(res_base[bt_price_col], errors="coerce").dropna().astype(
+                        float).sort_index()
 
-                    # recent history for visual context
-                    hist_context = price_full.loc[price_full.index <= anchor_used].tail(12).copy()
-
-                    # realized future path over the next bt_fwd bars
-                    actual_future = price_full.loc[price_full.index > anchor_used].head(int(bt_fwd)).copy()
-
-                    # benchmark history for tactical-state construction
-                    bench_hist = None
-                    if "QQQ" in res_base.columns:
-                        bench_full = pd.to_numeric(res_base["QQQ"], errors="coerce").dropna().astype(float).sort_index()
-                        bench_hist = bench_full.loc[bench_full.index <= anchor_used].copy()
-
-                    cone_cfg = MCValidationConfig(
-                        horizon_steps=int(bt_fwd),
-                        n_sims=int(wf_mc_sims),
-                        block_size=int(wf_mc_block),
-                        seed=7,
-                    )
-
-                    state_hist, meta = build_tactical_state_series(
-                        price=hist_px,
-                        benchmark_price=bench_hist,
-                        cfg=cone_cfg,
-                    )
-
-                    cone_df, state_used = mc.monte_carlo_cone_by_tactical_state_block(
-                        price=hist_px,
-                        state=state_hist,
-                        state_now=meta.get("state_now"),
-                        horizon_steps=int(bt_fwd),
-                        n_sims=int(wf_mc_sims),
-                        block_size=int(wf_mc_block),
-                        seed=7,
-                    )
-
-                    if cone_df.empty:
-                        st.info(f"Not enough history in tactical state ({state_used}) to build the cone.")
+                    if price_full.empty:
+                        st.info("Historical cone replay unavailable because the price series is empty.")
                     else:
-                        # Use actual future dates when available; otherwise fallback to monthly future dates
-                        if len(actual_future) >= len(cone_df):
-                            future_dates = actual_future.index[:len(cone_df)]
+                        anchor_ts = pd.Timestamp(bt_start)
+                        hist_px = price_full.loc[price_full.index <= anchor_ts].copy()
+
+                        if hist_px.empty:
+                            st.info("No price history available up to the selected Start date.")
                         else:
-                            future_dates = pd.date_range(
-                                start=anchor_used,
-                                periods=len(cone_df) + 1,
-                                freq="M"
-                            )[1:]
+                            anchor_used = hist_px.index[-1]
+                            start_price = float(hist_px.iloc[-1])
 
-                        cone_plot = cone_df.copy()
-                        cone_plot["future_date"] = future_dates
+                            # recent history for visual context
+                            hist_context = price_full.loc[price_full.index <= anchor_used].tail(12).copy()
 
-                        # prepend anchor point so p10/p50/p90 all start from same price
-                        anchor_row = pd.DataFrame({
-                            "future_date": [anchor_used],
-                            "p10": [start_price],
-                            "p50": [start_price],
-                            "p90": [start_price],
-                        })
-                        cone_plot = pd.concat(
-                            [anchor_row, cone_plot[["future_date", "p10", "p50", "p90"]]],
-                            ignore_index=True
-                        )
+                            # realized future path over the next bt_fwd bars
+                            actual_future = price_full.loc[price_full.index > anchor_used].head(int(bt_fwd)).copy()
 
-                        # actual realized path also starts from the anchor
-                        actual_plot = pd.concat([
-                            pd.Series([start_price], index=[anchor_used]),
-                            actual_future
-                        ]).sort_index()
+                            # benchmark history for tactical-state construction
+                            bench_hist = None
+                            if "QQQ" in res_base.columns:
+                                bench_full = pd.to_numeric(res_base["QQQ"], errors="coerce").dropna().astype(float).sort_index()
+                                bench_hist = bench_full.loc[bench_full.index <= anchor_used].copy()
 
-                        fig_cone = go.Figure()
+                            cone_cfg = MCValidationConfig(
+                                horizon_steps=int(bt_fwd),
+                                n_sims=int(wf_mc_sims),
+                                block_size=int(wf_mc_block),
+                                seed=7,
+                            )
 
-                        # recent history before anchor
-                        fig_cone.add_trace(go.Scatter(
-                            x=hist_context.index,
-                            y=hist_context.values,
-                            mode="lines",
-                            name="Actual price (pre-anchor)",
-                            line=dict(color="#7f7f7f"),
-                        ))
+                            state_hist, meta = build_tactical_state_series(
+                                price=hist_px,
+                                benchmark_price=bench_hist,
+                                cfg=cone_cfg,
+                            )
 
-                        # upper band first
-                        fig_cone.add_trace(go.Scatter(
-                            x=cone_plot["future_date"],
-                            y=cone_plot["p90"],
-                            mode="lines",
-                            name="MC p90",
-                            line=dict(color="#2ca02c", dash="dash"),
-                        ))
+                            cone_df, state_used = mc.monte_carlo_cone_by_tactical_state_block(
+                                price=hist_px,
+                                state=state_hist,
+                                state_now=meta.get("state_now"),
+                                horizon_steps=int(bt_fwd),
+                                n_sims=int(wf_mc_sims),
+                                block_size=int(wf_mc_block),
+                                seed=7,
+                            )
 
-                        # lower band, filled to previous trace
-                        fig_cone.add_trace(go.Scatter(
-                            x=cone_plot["future_date"],
-                            y=cone_plot["p10"],
-                            mode="lines",
-                            name="MC p10",
-                            line=dict(color="#d62728", dash="dash"),
-                            fill="tonexty",
-                            fillcolor="rgba(31,119,180,0.10)",
-                        ))
+                            if cone_df.empty:
+                                st.info(f"Not enough history in tactical state ({state_used}) to build the cone.")
+                            else:
+                                # Use actual future dates when available; otherwise fallback to monthly future dates
+                                if len(actual_future) >= len(cone_df):
+                                    future_dates = actual_future.index[:len(cone_df)]
+                                else:
+                                    future_dates = pd.date_range(
+                                        start=anchor_used,
+                                        periods=len(cone_df) + 1,
+                                        freq="M"
+                                    )[1:]
 
-                        # median path
-                        fig_cone.add_trace(go.Scatter(
-                            x=cone_plot["future_date"],
-                            y=cone_plot["p50"],
-                            mode="lines",
-                            name="MC p50",
-                            line=dict(color="#1f77b4", dash="dash"),
-                        ))
+                                cone_plot = cone_df.copy()
+                                cone_plot["future_date"] = future_dates
 
-                        # actual realized path
-                        fig_cone.add_trace(go.Scatter(
-                            x=actual_plot.index,
-                            y=actual_plot.values,
-                            mode="lines+markers",
-                            name="Actual realized path",
-                            line=dict(color="#000000", width=2),
-                        ))
+                                # prepend anchor point so p10/p50/p90 all start from same price
+                                anchor_row = pd.DataFrame({
+                                    "future_date": [anchor_used],
+                                    "p10": [start_price],
+                                    "p50": [start_price],
+                                    "p90": [start_price],
+                                })
+                                cone_plot = pd.concat(
+                                    [anchor_row, cone_plot[["future_date", "p10", "p50", "p90"]]],
+                                    ignore_index=True
+                                )
 
-                        fig_cone.update_layout(
-                            height=420,
-                            margin=dict(l=20, r=20, t=10, b=20),
-                            legend=dict(orientation="h"),
-                            yaxis=dict(title="Price"),
-                            hovermode="x unified",
-                        )
+                                # actual realized path also starts from the anchor
+                                actual_plot = pd.concat([
+                                    pd.Series([start_price], index=[anchor_used]),
+                                    actual_future
+                                ]).sort_index()
 
-                        st.caption(f"Anchor used: {anchor_used.date()} | MC tactical state: {state_used}")
-                        st.plotly_chart(fig_cone, use_container_width=True)
+                                fig_cone = go.Figure()
+
+                                # recent history before anchor
+                                fig_cone.add_trace(go.Scatter(
+                                    x=hist_context.index,
+                                    y=hist_context.values,
+                                    mode="lines",
+                                    name="Actual price (pre-anchor)",
+                                    line=dict(color="#7f7f7f"),
+                                ))
+
+                                # upper band first
+                                fig_cone.add_trace(go.Scatter(
+                                    x=cone_plot["future_date"],
+                                    y=cone_plot["p90"],
+                                    mode="lines",
+                                    name="MC p90",
+                                    line=dict(color="#2ca02c", dash="dash"),
+                                ))
+
+                                # lower band, filled to previous trace
+                                fig_cone.add_trace(go.Scatter(
+                                    x=cone_plot["future_date"],
+                                    y=cone_plot["p10"],
+                                    mode="lines",
+                                    name="MC p10",
+                                    line=dict(color="#d62728", dash="dash"),
+                                    fill="tonexty",
+                                    fillcolor="rgba(31,119,180,0.10)",
+                                ))
+
+                                # median path
+                                fig_cone.add_trace(go.Scatter(
+                                    x=cone_plot["future_date"],
+                                    y=cone_plot["p50"],
+                                    mode="lines",
+                                    name="MC p50",
+                                    line=dict(color="#1f77b4", dash="dash"),
+                                ))
+
+                                # actual realized path
+                                fig_cone.add_trace(go.Scatter(
+                                    x=actual_plot.index,
+                                    y=actual_plot.values,
+                                    mode="lines+markers",
+                                    name="Actual realized path",
+                                    line=dict(color="#000000", width=2),
+                                ))
+
+                                fig_cone.update_layout(
+                                    height=420,
+                                    margin=dict(l=20, r=20, t=10, b=20),
+                                    legend=dict(orientation="h"),
+                                    yaxis=dict(title="Price"),
+                                    hovermode="x unified",
+                                )
+
+                                st.caption(f"Anchor used: {anchor_used.date()} | MC tactical state: {state_used}")
+                                st.plotly_chart(fig_cone, use_container_width=True)
 
         if wf_mc_enabled and not bt_df.empty:
             mc_cols = [
@@ -4938,12 +5380,12 @@ It helps you compare which assets look more favorable, less favorable, or more u
                     "reason",
                 ] if c in compare_bt_df.columns]
 
-                st.write("Comparison macro input sample:")
-                st.dataframe(
-                    compare_bt_df[cmp_macro_debug_cols].head(25),
-                    width="stretch",
-                    hide_index=True,
-                )
+                # st.write("Comparison macro input sample:")
+                # st.dataframe(
+                #     compare_bt_df[cmp_macro_debug_cols].head(25),
+                #     width="stretch",
+                #     hide_index=True,
+                # )
 
     # ---- Gold-only panels must render ONLY in Tab1
     with tab1:

@@ -203,26 +203,35 @@ def run_walkforward_mc_validation(
 def summarize_mc_validation(validation_df: pd.DataFrame) -> dict:
     if validation_df is None or validation_df.empty:
         return {}
+
     df = validation_df.copy()
-    actual = pd.to_numeric(df.get("mc_actual_ret_pct"), errors="coerce")
-    p50 = pd.to_numeric(df.get("mc_p50_ret_pct"), errors="coerce")
+
+    def _num_col(name: str) -> pd.Series:
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce")
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+
     valid = pd.DataFrame({
-        "actual": actual,
-        "p50": p50,
-        "inside": pd.to_numeric(df.get("mc_inside_p10_p90"), errors="coerce"),
-        "below": pd.to_numeric(df.get("mc_below_p10"), errors="coerce"),
-        "above": pd.to_numeric(df.get("mc_above_p90"), errors="coerce"),
-        "dir": pd.to_numeric(df.get("mc_direction_hit"), errors="coerce"),
-        "err": pd.to_numeric(df.get("mc_abs_err_p50"), errors="coerce"),
-    }).dropna(subset=["actual", "p50"])
+        "actual": _num_col("mc_actual_ret_pct"),
+        "p50": _num_col("mc_p50_ret_pct"),
+        "inside": _num_col("mc_inside_p10_p90"),
+        "below": _num_col("mc_below_p10"),
+        "above": _num_col("mc_above_p90"),
+        "dir": _num_col("mc_direction_hit"),
+        "err": _num_col("mc_abs_err_p50"),
+    }, index=df.index).dropna(subset=["actual", "p50"])
+
     if valid.empty:
         return {"rows": 0}
+
+    err_nonnull = valid["err"].dropna()
+
     return {
         "rows": int(len(valid)),
         "inside_p10_p90_pct": float(valid["inside"].fillna(0).astype(bool).mean()) * 100.0,
         "below_p10_pct": float(valid["below"].fillna(0).astype(bool).mean()) * 100.0,
         "above_p90_pct": float(valid["above"].fillna(0).astype(bool).mean()) * 100.0,
         "direction_hit_pct": float(valid["dir"].fillna(0).astype(bool).mean()) * 100.0,
-        "median_abs_err_pct": float(valid["err"].dropna().median()) if valid["err"].dropna().shape[0] else np.nan,
-        "mean_abs_err_pct": float(valid["err"].dropna().mean()) if valid["err"].dropna().shape[0] else np.nan,
+        "median_abs_err_pct": float(err_nonnull.median()) if len(err_nonnull) else np.nan,
+        "mean_abs_err_pct": float(err_nonnull.mean()) if len(err_nonnull) else np.nan,
     }
